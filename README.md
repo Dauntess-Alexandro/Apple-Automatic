@@ -20,6 +20,25 @@
 *   **🧠 Умный маппинг вариантов:** Скрипт автоматически распознает названия вариантов в Apple (понимает как `Variant A`, так и `Treatment A`).
 *   **💅 Современный GUI:** Интерфейс в темной теме на базе PySide6 с авто-загрузкой иконок флагов для удобной навигации по локалям.
 *   **💾 Автосохранение сессий:** Ваши API-ключи надежно сохраняются локально в файл `.env`.
+*   **🧾 Первичная загрузка метаданных через GUI:** Отдельная вкладка с обычными полями интерфейса загружает description, keywords, whatsNew/release notes, App Review notes, subtitle, privacy policy URL и category/appInfo-поля. JSON остался только как дополнительный режим для сложных `custom_requests`.
+
+---
+
+## 🧾 Первичная загрузка метаданных через GUI
+
+Во вкладке **«ПЕРВИЧНАЯ ЗАГРУЗКА»** больше не нужно писать весь JSON вручную. Основные данные вводятся прямо в интерфейсе:
+
+*   **Локаль:** выбор языка вручную или кнопка **«🌐 Взять primary locale из Apple»**, которая сама подтянет основную локаль приложения из App Store Connect.
+*   **Version metadata:** description, keywords, promotional text, support URL, marketing URL и What's New / release notes.
+*   **App info:** name, subtitle, privacy policy URL, privacy choices URL, primary/secondary category через выпадающий список и подсказка age/kids age band по умолчанию `4+`.
+*   **App Review notes:** контактные данные, demo account и notes для команды ревью Apple.
+*   **AI генерация (Gemini):** можно вставить Gemini API key, developer name, свое ТЗ/brief и отдельный промт генерации. Доступны prompt profiles, отдельные кнопки для генерации description, keywords, subtitle, category, App Review notes, переписывания description и сокращения keywords, а также Fix with AI / quick fixes; app name не меняется AI.
+
+Кнопка **«🧩 Заполнить пример»** заполняет эти поля тестовыми данными, чтобы было понятно, что куда вводить. Кнопка **«📄 Импорт JSON в поля»** оставлена для совместимости: можно загрузить старый JSON, и программа разложит его значения по GUI-полям. Кнопка **«🔍 Preview & Validate»** показывает payload перед отправкой и выполняет строгие ASO-проверки: лимиты, banned words, dash symbols, дубли keywords, generic keywords, слова из app name/subtitle и URL-подсказки. Кнопка **«⬇️ Pull from Apple»** подтягивает текущие метаданные выбранной локали из App Store Connect в форму.
+
+Gemini API key, модель и developer name сохраняются локально в `.env` рядом с App Store Connect настройками. При выборе файла `AuthKey_XXXX.p8` программа автоматически подставляет `KEY_ID` из имени файла; `Issuer ID` нужно ввести вручную, потому что его нет внутри `.p8`. App name вводится вручную и не перезаписывается AI. Перед отправкой в Apple обязательно проверьте AI-тексты и category ID вручную.
+
+Блок **custom_requests** остался только как продвинутый дополнительный режим. Он нужен для специфичных сущностей App Store Connect, например app availability или возрастных деклараций, где payload зависит от конкретной анкеты Apple. Отдельная вкладка **«APP PRIVACY»** формирует privacy draft с дефолтами: Device ID для Analytics, not tracking, not linked; Crash Data для Analytics, tracking, not linked. Перед реальной отправкой privacy endpoint нужно проверить и заменить на точный App Store Connect endpoint.
 
 ---
 
