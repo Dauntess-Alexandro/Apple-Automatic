@@ -3,6 +3,7 @@ import sys
 import time
 import jwt
 import requests
+import threading
 import concurrent.futures
 from dotenv import load_dotenv
 from PySide6.QtWidgets import (
@@ -122,36 +123,46 @@ class ASCClient:
         }
         return jwt.encode(payload, self.private_key, algorithm="ES256", headers=headers)
 
-    def _request(self, method, endpoint, payload=None):
-        token = self._generate_token()
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
+    # Умная функция запроса с защитой от лимитов Apple
+    def _request(self, method, endpoint, payload=None, max_retries=4):
         url = f"{self.base_url}/{endpoint}"
         
-        try:
-            if method == "GET":
-                response = requests.get(url, headers=headers)
-            elif method == "POST":
-                response = requests.post(url, headers=headers, json=payload)
-            elif method == "PATCH":
-                response = requests.patch(url, headers=headers, json=payload)
-            elif method == "DELETE":
-                response = requests.delete(url, headers=headers)
+        for attempt in range(max_retries):
+            token = self._generate_token()
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+            try:
+                if method == "GET":
+                    response = requests.get(url, headers=headers)
+                elif method == "POST":
+                    response = requests.post(url, headers=headers, json=payload)
+                elif method == "PATCH":
+                    response = requests.patch(url, headers=headers, json=payload)
+                elif method == "DELETE":
+                    response = requests.delete(url, headers=headers)
+                    response.raise_for_status()
+                    return {} 
+                else:
+                    return None
+                    
                 response.raise_for_status()
-                return {} 
-            else:
-                return None
+                return response.json()
                 
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            err_msg = str(e)
-            if e.response is not None:
-                err_msg += f" | {e.response.text}"
-            self.logger(f"HTTP Error: {err_msg}")
-            raise Exception(f"API Request failed: {endpoint.split('/')[0]}")
+            except requests.exceptions.RequestException as e:
+                # Если сервер просит притормозить (ошибка 429 или 502/503)
+                if e.response is not None and e.response.status_code in [429, 502, 503]:
+                    if attempt < max_retries - 1:
+                        sleep_time = 2 ** attempt # Экспоненциальная пауза: 1 сек, 2 сек, 4 сек
+                        time.sleep(sleep_time)
+                        continue
+                        
+                err_msg = str(e)
+                if e.response is not None:
+                    err_msg += f" | {e.response.text}"
+                self.logger(f"HTTP Error: {err_msg}")
+                raise Exception(f"API Request failed: {endpoint.split('/')[0]}")
 
     def get_latest_app_store_version(self):
         self.logger("Получение актуальной версии приложения...")
@@ -294,6 +305,7 @@ class ASCClient:
         screenshot_id = res["data"]["id"]
         upload_operations = res["data"]["attributes"]["uploadOperations"]
         
+        # Загрузка бинарных данных на AWS сервера Apple
         with open(file_path, "rb") as f:
             for operation in upload_operations:
                 headers = {h["name"]: h["value"] for h in operation["requestHeaders"]}
@@ -302,8 +314,15 @@ class ASCClient:
                 f.seek(offset)
                 chunk = f.read(length)
                 
-                req = requests.put(operation["url"], headers=headers, data=chunk)
-                req.raise_for_status()
+                # Здесь тоже может быть сетевая ошибка, добавляем простые попытки
+                for attempt in range(3):
+                    try:
+                        req = requests.put(operation["url"], headers=headers, data=chunk)
+                        req.raise_for_status()
+                        break
+                    except requests.exceptions.RequestException:
+                        if attempt == 2: raise
+                        time.sleep(1)
 
         commit_payload = {
             "data": {
@@ -381,75 +400,37 @@ class AutomationWorker(QThread):
             if not active_variants:
                 raise Exception("Не выбрана ни одна папка со скриншотами для загрузки.")
 
-            completed_tasks = 0
-            start_time = time.time()
+            upload_tasks = [] # Единый список всех задач для многопоточности
 
+            # === ПОДГОТОВКА СТРУКТУРЫ ТЕСТА ===
             if self.mode == "create":
                 app_locales = client.get_version_locales(version_id)
                 num_locales = len(app_locales)
                 self.log_msg.emit(f"Найдено локалей в приложении: {num_locales}")
-                
-                total_tasks = 1 
-                for v_name, f_path, files in active_variants:
-                    total_tasks += 1 + num_locales 
-                    total_tasks += num_locales * (1 + len(files))
-
-                def tick():
-                    nonlocal completed_tasks
-                    completed_tasks += 1
-                    percent = int((completed_tasks / total_tasks) * 100)
-                    elapsed = time.time() - start_time
-                    avg = elapsed / completed_tasks
-                    rem = avg * (total_tasks - completed_tasks)
-                    m, s = divmod(int(rem), 60)
-                    self.progress_update.emit(percent, f"Осталось: ~{m:02d}:{s:02d}")
-
                 self.log_msg.emit(f"Создание теста '{self.test_name}'...")
-                experiment_id = client.create_ppo_experiment(version_id, self.test_name, self.traffic)
-                tick()
                 
-                treatment_ids = {}
-                localization_ids = {}
+                experiment_id = client.create_ppo_experiment(version_id, self.test_name, self.traffic)
                 
                 self.log_msg.emit("ШАГ 1: Создание структуры теста...")
                 for variant_name in self.variants_paths.keys():
                     treatment_id = client.create_treatment(experiment_id, variant_name)
-                    treatment_ids[variant_name] = treatment_id
-                    tick()
                     
-                    localization_ids[variant_name] = {}
                     for locale in app_locales:
                         loc_id = client.create_treatment_localization(treatment_id, locale)
-                        localization_ids[variant_name][locale] = loc_id
-                        tick()
+                        
+                        # Собираем задачу в список для дальнейшей многопоточной загрузки
+                        for active_v_name, f_path, files in active_variants:
+                            if active_v_name == variant_name:
+                                upload_tasks.append({
+                                    "variant": variant_name, 
+                                    "locale": locale, 
+                                    "loc_id": loc_id,
+                                    "folder": f_path, 
+                                    "files": files
+                                })
                         
                 client.update_ppo_experiment(experiment_id, self.traffic)
-                self.log_msg.emit("✅ Структура готова!")
-                
-                self.log_msg.emit("ШАГ 2: Загрузка скриншотов...")
-                for variant_name, folder_path, files in active_variants:
-                    for locale in app_locales:
-                        localization_id = localization_ids[variant_name][locale]
-                        
-                        sets = client.get_screenshot_sets(localization_id)
-                        target_set_id = None
-                        for s in sets:
-                            if s["attributes"]["screenshotDisplayType"] == "APP_IPHONE_67":
-                                target_set_id = s["id"]
-                            for old_sc in client.get_screenshots(s["id"]):
-                                client.delete_screenshot(old_sc["id"])
-                        
-                        if not target_set_id:
-                            target_set_id = client.create_screenshot_set(localization_id, "APP_IPHONE_67")
-                        tick()
-
-                        for index, filename in enumerate(files, start=1):
-                            filepath = os.path.join(folder_path, filename)
-                            ext = os.path.splitext(filename)[1].lower() 
-                            new_filename = f"{index}{ext}"
-                            self.log_msg.emit(f"[{variant_name} | {locale}] Загрузка {new_filename}...")
-                            client.upload_screenshot(target_set_id, filepath, new_filename)
-                            tick()
+                self.log_msg.emit("✅ Структура готова! Переход к загрузке.")
 
             elif self.mode == "update":
                 self.log_msg.emit(f"Поиск теста '{self.test_name}'...")
@@ -462,13 +443,10 @@ class AutomationWorker(QThread):
                 treatments = client.get_treatments(exp_id)
                 treatment_map = {t["attributes"]["name"]: t["id"] for t in treatments}
 
-                update_tasks = []
                 for v_name, f_path, files in active_variants:
                     if v_name not in self.target_variants:
                         continue 
                         
-                    # --- УМНЫЙ ПОИСК ИМЕНИ ВАРИАНТА ---
-                    # Если пользователь ищет "Variant C", а в Apple он называется "Treatment C"
                     actual_treatment_name = None
                     if v_name in treatment_map:
                         actual_treatment_name = v_name
@@ -478,7 +456,7 @@ class AutomationWorker(QThread):
                             actual_treatment_name = alt_name
 
                     if not actual_treatment_name:
-                        self.log_msg.emit(f"⚠️ Вариант '{v_name}' (или Treatment) не найден в Apple. Пропуск.")
+                        self.log_msg.emit(f"Внимание: Вариант '{v_name}' не найден в Apple. Пропуск.")
                         continue
                         
                     t_id = treatment_map[actual_treatment_name]
@@ -489,18 +467,31 @@ class AutomationWorker(QThread):
                         if locale_code not in self.target_locales:
                             continue 
                             
-                        update_tasks.append({
-                            "variant": actual_treatment_name, "locale": locale_code, "loc_id": loc["id"],
-                            "folder": f_path, "files": files
+                        upload_tasks.append({
+                            "variant": actual_treatment_name, 
+                            "locale": locale_code, 
+                            "loc_id": loc["id"],
+                            "folder": f_path, 
+                            "files": files
                         })
 
-                if not update_tasks:
-                    raise Exception("Не найдено подходящих локалей или вариантов для обновления. Проверьте галочки.")
+                if not upload_tasks:
+                    raise Exception("Не найдено локалей или вариантов для обновления. Проверьте галочки.")
 
-                total_tasks = sum([1 + len(task["files"]) for task in update_tasks])
+            # === МНОГОПОТОЧНАЯ ЗАГРУЗКА КАРТИНОК ===
+            if not upload_tasks:
+                self.log_msg.emit("Задач на загрузку картинок нет.")
+                self.finished.emit()
+                return
 
-                def tick():
-                    nonlocal completed_tasks
+            total_tasks = sum([1 + len(task["files"]) for task in upload_tasks])
+            completed_tasks = 0
+            start_time = time.time()
+            progress_lock = threading.Lock() # Блокировка для безопасного обновления прогресса
+
+            def tick():
+                nonlocal completed_tasks
+                with progress_lock:
                     completed_tasks += 1
                     percent = int((completed_tasks / total_tasks) * 100)
                     elapsed = time.time() - start_time
@@ -509,33 +500,47 @@ class AutomationWorker(QThread):
                     m, s = divmod(int(rem), 60)
                     self.progress_update.emit(percent, f"Осталось: ~{m:02d}:{s:02d}")
 
-                self.log_msg.emit(f"Найдено локалей для точечного обновления: {len(update_tasks)}")
+            # Рабочая функция для одного потока
+            def upload_worker(task):
+                friendly_name = LOCALE_MAP.get(task['locale'], ("", task['locale']))[1]
+                self.log_msg.emit(f"[{task['variant']} | {friendly_name}] Запуск обработки...")
                 
-                for task in update_tasks:
-                    friendly_name = LOCALE_MAP.get(task['locale'], ("", task['locale']))[1]
-                    self.log_msg.emit(f"[{task['variant']} | {friendly_name}] Очистка и заливка...")
-                    sets = client.get_screenshot_sets(task['loc_id'])
-                    target_set_id = None
-                    
-                    for s in sets:
-                        if s["attributes"]["screenshotDisplayType"] == "APP_IPHONE_67":
-                            target_set_id = s["id"]
-                        for old_sc in client.get_screenshots(s["id"]):
-                            client.delete_screenshot(old_sc["id"])
-                            
-                    if not target_set_id:
-                        target_set_id = client.create_screenshot_set(task['loc_id'], "APP_IPHONE_67")
-                    tick()
+                sets = client.get_screenshot_sets(task['loc_id'])
+                target_set_id = None
+                
+                for s in sets:
+                    if s["attributes"]["screenshotDisplayType"] == "APP_IPHONE_67":
+                        target_set_id = s["id"]
+                    for old_sc in client.get_screenshots(s["id"]):
+                        client.delete_screenshot(old_sc["id"])
+                        
+                if not target_set_id:
+                    target_set_id = client.create_screenshot_set(task['loc_id'], "APP_IPHONE_67")
+                tick() # Тик после создания сета/очистки
 
-                    for index, filename in enumerate(task['files'], start=1):
-                        filepath = os.path.join(task['folder'], filename)
-                        ext = os.path.splitext(filename)[1].lower() 
-                        new_filename = f"{index}{ext}"
-                        client.upload_screenshot(target_set_id, filepath, new_filename)
-                        tick()
+                for index, filename in enumerate(task['files'], start=1):
+                    filepath = os.path.join(task['folder'], filename)
+                    ext = os.path.splitext(filename)[1].lower() 
+                    new_filename = f"{index}{ext}"
+                    client.upload_screenshot(target_set_id, filepath, new_filename)
+                    tick() # Тик после загрузки файла
+
+            self.log_msg.emit(f"Начинаем многопоточную загрузку ({len(upload_tasks)} локалей)...")
+            
+            # Запускаем пул потоков (5 параллельных загрузок)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                futures = [executor.submit(upload_worker, t) for t in upload_tasks]
+                
+                # Ожидаем завершения всех потоков и отлавливаем ошибки
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        raise Exception(f"Сбой в одном из потоков: {str(e)}")
 
             self.progress_update.emit(100, "Завершено!")
             self.log_msg.emit("=== ПРОЦЕСС УСПЕШНО ЗАВЕРШЕН! ===")
+            
         except Exception as e:
             self.progress_update.emit(0, "Ошибка выполнения")
             self.log_msg.emit(f"КРИТИЧЕСКАЯ ОШИБКА: {str(e)}")
@@ -617,7 +622,6 @@ class MainWindow(QWidget):
         self.chk_var_b = QCheckBox("Variant B (или Treatment B)")
         self.chk_var_c = QCheckBox("Variant C (или Treatment C)")
         
-        # Сохраняем логические ключи для бэкенда
         self.chk_var_a.setProperty("variant_id", "Variant A")
         self.chk_var_b.setProperty("variant_id", "Variant B")
         self.chk_var_c.setProperty("variant_id", "Variant C")
@@ -644,7 +648,6 @@ class MainWindow(QWidget):
         grid = QGridLayout(scroll_widget)
         
         self.locale_checkboxes = []
-        
         sorted_locales = sorted(LOCALE_MAP.items(), key=lambda item: item[1][1])
         
         row, col = 0, 0
@@ -876,7 +879,6 @@ class MainWindow(QWidget):
             test_name = self.update_name_combo.currentText().strip()
             traffic = ""
             
-            # Используем скрытые ключи свойств для передачи в бэкенд ("Variant A", и т.д.)
             if self.chk_var_a.isChecked(): target_variants.append(self.chk_var_a.property("variant_id"))
             if self.chk_var_b.isChecked(): target_variants.append(self.chk_var_b.property("variant_id"))
             if self.chk_var_c.isChecked(): target_variants.append(self.chk_var_c.property("variant_id"))
