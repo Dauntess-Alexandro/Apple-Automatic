@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QLineEdit, QPushButton, QTextEdit, QFileDialog, QLabel, QGroupBox,
-    QProgressBar, QTabWidget, QCheckBox, QScrollArea, QComboBox
+    QProgressBar, QTabWidget, QCheckBox, QScrollArea, QComboBox, QToolButton
 )
 from PySide6.QtGui import QIcon
 from PySide6.QtCore import QThread, Signal, Qt, QSize
@@ -40,6 +40,127 @@ def _read_env_file():
     except OSError:
         pass
     return values
+
+
+REQUIRED_APP_REVIEW_FIELDS = ("contactEmail", "contactPhone")
+
+# Лимиты Apple (символы)
+METADATA_FIELD_LIMITS = {
+    "description": 4000,
+    "keywords": 100,
+    "promotionalText": 170,
+    "subtitle": 30,
+    "name": 30,
+    "notes": 4000,
+}
+
+# Поля version localization, которые Apple может отклонить по статусу версии
+VERSION_LOCALIZATION_STATE_OPTIONAL = ("whatsNew", "promotionalText")
+APP_STORE_VERSION_STATE_OPTIONAL = ("copyright",)
+APP_INFO_LOCALIZATION_UNKNOWN = ("privacyPolicyText",)  # tvOS, не iOS
+
+
+def normalize_review_phone(phone):
+    """Формат Apple: +<код страны> <номер>, например +1 555 010 0611."""
+    raw = str(phone or "").strip()
+    if not raw:
+        return ""
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return ""
+    if raw.lstrip().startswith("+"):
+        digits = digits  # already includes country if user typed +44...
+    elif len(digits) == 10:
+        digits = "1" + digits
+    elif len(digits) == 11 and digits.startswith("1"):
+        pass
+    else:
+        digits = digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+1 {digits[1:4]} {digits[4:7]} {digits[7:11]}"
+    if len(digits) >= 8:
+        cc = digits[0] if len(digits) <= 11 else digits[:2]
+        rest = digits[len(cc):]
+        chunks = [rest[i:i + 3] for i in range(0, len(rest), 3)]
+        return f"+{cc} " + " ".join(chunks).strip()
+    return f"+{digits}"
+
+
+def prepare_app_review_detail_attributes(source, existing=None):
+    """Собирает полный набор полей для App Review (PATCH требует email и phone)."""
+    existing = existing or {}
+    allowed = {
+        "contactFirstName", "contactLastName", "contactPhone", "contactEmail",
+        "demoAccountName", "demoAccountPassword", "demoAccountRequired", "notes"
+    }
+    merged = {}
+    for field in allowed:
+        if field in source and source[field] not in (None, ""):
+            merged[field] = source[field]
+        elif field in existing and existing[field] not in (None, ""):
+            merged[field] = existing[field]
+    if "demoAccountRequired" in source:
+        merged["demoAccountRequired"] = bool(source["demoAccountRequired"])
+    if merged.get("contactPhone"):
+        merged["contactPhone"] = normalize_review_phone(merged["contactPhone"])
+    missing = [field for field in REQUIRED_APP_REVIEW_FIELDS if not merged.get(field)]
+    if merged.get("demoAccountRequired") and (
+        not merged.get("demoAccountName") or not merged.get("demoAccountPassword")
+    ):
+        missing.append("demoAccountName/demoAccountPassword (нужны при demo account)")
+    return merged, missing
+
+
+def sanitize_metadata_urls(attributes):
+    result = dict(attributes)
+    for key in ("supportUrl", "marketingUrl", "privacyPolicyUrl", "privacyChoicesUrl"):
+        value = result.get(key)
+        if not value:
+            continue
+        url = str(value).strip()
+        if url and not url.startswith(("http://", "https://")):
+            url = "https://" + url.lstrip("/")
+        result[key] = url
+    return result
+
+
+def apply_metadata_field_limits(attributes, limits_map, logger=None):
+    result = {}
+    for key, value in attributes.items():
+        if value in (None, ""):
+            continue
+        if key in limits_map and isinstance(value, str) and len(value) > limits_map[key]:
+            limit = limits_map[key]
+            if logger:
+                logger(f"⚠️ {key}: обрезано {len(value)} → {limit} символов")
+            result[key] = value[:limit]
+        else:
+            result[key] = value
+    return result
+
+
+def sanitize_version_localization_attributes(attributes, logger=None):
+    attrs = sanitize_metadata_urls(attributes)
+    if attrs.get("keywords") and isinstance(attrs["keywords"], str):
+        attrs["keywords"] = attrs["keywords"].lower().replace(" ", "")
+    return apply_metadata_field_limits(attrs, METADATA_FIELD_LIMITS, logger)
+
+
+def sanitize_app_info_localization_attributes(attributes, logger=None):
+    attrs = sanitize_metadata_urls(attributes)
+    return apply_metadata_field_limits(attrs, METADATA_FIELD_LIMITS, logger)
+
+
+def resolve_app_category_id(category_id):
+    """Конвертирует iTunes genre ID (6016) или API id (ENTERTAINMENT) в appCategories id."""
+    if not category_id:
+        return ""
+    raw = str(category_id).strip()
+    if raw in ITUNES_GENRE_TO_APP_CATEGORY:
+        return ITUNES_GENRE_TO_APP_CATEGORY[raw]
+    if re.fullmatch(r"[A-Z][A-Z0-9_]*", raw):
+        return raw
+    return ""
 
 
 def resolve_tinypng_api_key():
@@ -116,6 +237,40 @@ APP_CATEGORY_OPTIONS = [
     ("6026", "Developer Tools"),
     ("6027", "Graphics & Design"),
 ]
+
+# iTunes genre ID (GUI) → App Store Connect API appCategories id
+ITUNES_GENRE_TO_APP_CATEGORY = {
+    "6000": "BUSINESS",
+    "6001": "WEATHER",
+    "6002": "UTILITIES",
+    "6003": "TRAVEL",
+    "6004": "SPORTS",
+    "6005": "SOCIAL_NETWORKING",
+    "6006": "REFERENCE",
+    "6007": "PRODUCTIVITY",
+    "6008": "PHOTO_AND_VIDEO",
+    "6009": "NEWS",
+    "6010": "NAVIGATION",
+    "6011": "MUSIC",
+    "6012": "LIFESTYLE",
+    "6013": "HEALTH_AND_FITNESS",
+    "6014": "GAMES",
+    "6015": "FINANCE",
+    "6016": "ENTERTAINMENT",
+    "6017": "EDUCATION",
+    "6018": "BOOKS",
+    "6020": "MEDICAL",
+    "6023": "FOOD_AND_DRINK",
+    "6024": "SHOPPING",
+    "6025": "STICKERS",
+    "6026": "DEVELOPER_TOOLS",
+    "6027": "GRAPHICS_AND_DESIGN",
+}
+
+APP_CATEGORY_RELATIONSHIP_FIELDS = (
+    "primaryCategory", "primarySubcategoryOne", "primarySubcategoryTwo",
+    "secondaryCategory", "secondarySubcategoryOne", "secondarySubcategoryTwo",
+)
 
 BANNED_ASO_WORDS = [
     "revolutionary", "seamless", "unlock", "empower", "unleash",
@@ -348,6 +503,10 @@ class ASCClient:
             raise Exception("Не найдена подходящая версия приложения для работы.")
         return data["data"][0]["id"]
 
+    def get_app_store_version_attributes(self, version_id):
+        data = self._request("GET", f"appStoreVersions/{version_id}")
+        return data.get("data", {}).get("attributes", {}) if data else {}
+
     def get_version_locales(self, version_id):
         endpoint = f"appStoreVersions/{version_id}/appStoreVersionLocalizations"
         data = self._request("GET", endpoint)
@@ -375,15 +534,59 @@ class ASCClient:
         }
         return self._request("POST", "appStoreVersionLocalizations", payload)["data"]["id"]
 
-    def update_version_localization(self, localization_id, attributes):
-        payload = {
-            "data": {
-                "type": "appStoreVersionLocalizations",
-                "id": localization_id,
-                "attributes": attributes
+    def _patch_resource_attributes(self, resource_type, resource_id, attributes, optional_fields=()):
+        """PATCH с отбрасыванием полей, которые Apple не принимает в текущем статусе."""
+        endpoint = f"{resource_type}/{resource_id}"
+        current = dict(attributes)
+        stripped = []
+        while current:
+            payload = {
+                "data": {
+                    "type": resource_type,
+                    "id": resource_id,
+                    "attributes": current,
+                }
             }
-        }
-        self._request("PATCH", f"appStoreVersionLocalizations/{localization_id}", payload)
+            try:
+                self._request("PATCH", endpoint, payload)
+                return "partial" if stripped else "ok"
+            except Exception as exc:
+                err_text = str(exc).lower()
+                removed = None
+                match = re.search(r"attribute\s+'([\w]+)'", err_text)
+                if match and match.group(1) in current:
+                    removed = match.group(1)
+                if not removed:
+                    for field in optional_fields:
+                        if field not in current:
+                            continue
+                        field_token = field.lower().replace("_", "")
+                        if field_token in err_text.replace("_", ""):
+                            removed = field
+                            break
+                if removed:
+                    current.pop(removed)
+                    stripped.append(removed)
+                    self.logger(f"⚠️ {removed} пропущен — недоступен для текущего статуса в Apple.")
+                    continue
+                raise
+        return "skipped"
+
+    def update_version_localization(self, localization_id, attributes):
+        return self._patch_resource_attributes(
+            "appStoreVersionLocalizations",
+            localization_id,
+            attributes,
+            VERSION_LOCALIZATION_STATE_OPTIONAL,
+        )
+
+    def update_app_store_version(self, version_id, attributes):
+        return self._patch_resource_attributes(
+            "appStoreVersions",
+            version_id,
+            attributes,
+            APP_STORE_VERSION_STATE_OPTIONAL,
+        )
 
     def get_app_primary_locale(self):
         data = self._request("GET", f"apps/{self.app_id}?fields[apps]=primaryLocale")
@@ -418,14 +621,12 @@ class ASCClient:
         return self._request("POST", "appInfoLocalizations", payload)["data"]["id"]
 
     def update_app_info_localization(self, localization_id, attributes):
-        payload = {
-            "data": {
-                "type": "appInfoLocalizations",
-                "id": localization_id,
-                "attributes": attributes
-            }
-        }
-        self._request("PATCH", f"appInfoLocalizations/{localization_id}", payload)
+        return self._patch_resource_attributes(
+            "appInfoLocalizations",
+            localization_id,
+            attributes,
+            APP_INFO_LOCALIZATION_UNKNOWN,
+        )
 
     def update_app_info(self, app_info_id, attributes=None, relationships=None):
         payload = {
@@ -707,8 +908,9 @@ class MetadataWorker(QThread):
     }
     APP_INFO_LOCALIZATION_FIELDS = {
         "name", "subtitle", "privacyPolicyUrl", "privacyChoicesUrl",
-        "privacyPolicyText", "copyright"
+        # privacyPolicyText — только tvOS, для iOS не отправляем
     }
+    APP_STORE_VERSION_FIELDS = {"copyright"}
     APP_REVIEW_DETAIL_FIELDS = {
         "contactFirstName", "contactLastName", "contactPhone", "contactEmail",
         "demoAccountName", "demoAccountPassword", "demoAccountRequired", "notes"
@@ -720,11 +922,15 @@ class MetadataWorker(QThread):
         self.metadata_config = metadata_config
         self.success = False
 
-    def _clean_attributes(self, source, allowed_fields):
+    def _clean_version_attributes(self, source):
         normalized = dict(source)
-        for alias in ("notes", "releaseNotes", "whats_new"):
+        for alias in ("releaseNotes", "whats_new"):
             if alias in normalized and "whatsNew" not in normalized:
                 normalized["whatsNew"] = normalized[alias]
+        return self._clean_attributes(normalized, self.VERSION_LOCALIZATION_FIELDS)
+
+    def _clean_attributes(self, source, allowed_fields):
+        normalized = dict(source)
         if "kidsAgeBand" in normalized:
             raw_age = str(normalized.get("kidsAgeBand", "")).strip()
             allowed_age_bands = {"", "FIVE_AND_UNDER", "SIX_TO_EIGHT", "NINE_TO_ELEVEN"}
@@ -751,6 +957,7 @@ class MetadataWorker(QThread):
                 len(self.metadata_config.get("version_localizations", [])) +
                 len(self.metadata_config.get("app_info_localizations", [])) +
                 (1 if self.metadata_config.get("app_info") else 0) +
+                (1 if self.metadata_config.get("app_store_version") else 0) +
                 (1 if self.metadata_config.get("app_review_detail") else 0) +
                 len(self.metadata_config.get("custom_requests", []))
             )
@@ -763,9 +970,19 @@ class MetadataWorker(QThread):
                 percent = int((tasks_done / total_tasks) * 100)
                 self.progress_update.emit(percent, message)
 
+            version_id = None
             version_localizations = self.metadata_config.get("version_localizations", [])
+            include_whats_new = bool(self.metadata_config.get("include_whats_new", False))
             if version_localizations:
                 version_id = client.get_latest_app_store_version()
+                version_attrs = client.get_app_store_version_attributes(version_id)
+                version_state = version_attrs.get("appStoreState", "")
+                if version_state == "READY_FOR_SALE" and include_whats_new:
+                    self.log_msg.emit(
+                        "⚠️ What's New не отправляется: версия уже в продаже. "
+                        "Создайте новую версию (1.0.1) для release notes."
+                    )
+                    include_whats_new = False
                 existing_records = client.get_version_localization_records(version_id)
                 existing_by_locale = {item["attributes"]["locale"]: item["id"] for item in existing_records}
 
@@ -773,17 +990,39 @@ class MetadataWorker(QThread):
                     locale = item.get("locale")
                     if not locale:
                         raise Exception("В version_localizations найдена запись без locale.")
-                    attributes = self._clean_attributes(item, self.VERSION_LOCALIZATION_FIELDS)
+                    attributes = sanitize_version_localization_attributes(
+                        self._clean_version_attributes(item),
+                        self.log_msg.emit,
+                    )
+                    if not include_whats_new and attributes.pop("whatsNew", None):
+                        self.log_msg.emit(
+                            f"[{locale}] What's New не отправлен "
+                            "(первая версия / галочка «Отправлять What's New» выключена)."
+                        )
                     if not attributes:
                         self.log_msg.emit(f"[{locale}] Нет version-полей для обновления, пропуск.")
                         tick(f"Пропуск {locale}")
                         continue
 
                     if locale in existing_by_locale:
-                        client.update_version_localization(existing_by_locale[locale], attributes)
-                        self.log_msg.emit(f"✅ [{locale}] Обновлены description/keywords/notes/URLs.")
+                        result = client.update_version_localization(existing_by_locale[locale], attributes)
+                        if result == "skipped":
+                            self.log_msg.emit(
+                                f"⚠️ [{locale}] whatsNew недоступен в текущем статусе версии — "
+                                "заполните description/keywords или создайте новую версию."
+                            )
+                        elif result == "partial":
+                            self.log_msg.emit(
+                                f"✅ [{locale}] Обновлены поля version metadata "
+                                f"(часть полей пропущена — статус версии в Apple)."
+                            )
+                        else:
+                            self.log_msg.emit(f"✅ [{locale}] Обновлены description/keywords/URLs.")
                     else:
-                        client.create_version_localization(version_id, locale, attributes)
+                        client.create_version_localization(
+                            version_id, locale,
+                            sanitize_version_localization_attributes(attributes, self.log_msg.emit),
+                        )
                         self.log_msg.emit(f"✅ [{locale}] Создана version-локализация.")
                     tick(f"Готово {locale}")
 
@@ -794,16 +1033,34 @@ class MetadataWorker(QThread):
 
                 if app_info_payload:
                     relationships = {}
-                    for rel_name in (
-                        "primaryCategory", "primarySubcategoryOne", "primarySubcategoryTwo",
-                        "secondaryCategory", "secondarySubcategoryOne", "secondarySubcategoryTwo"
-                    ):
+                    for rel_name in APP_CATEGORY_RELATIONSHIP_FIELDS:
                         category_id = app_info_payload.get(rel_name)
-                        if category_id:
-                            relationships[rel_name] = {"data": {"type": "appCategories", "id": category_id}}
-                    attributes = {k: v for k, v in app_info_payload.items() if k not in relationships and v not in (None, "")}
-                    client.update_app_info(app_info_id, attributes or None, relationships or None)
-                    self.log_msg.emit("✅ Обновлены category/возрастные и другие appInfo-поля.")
+                        if not category_id:
+                            continue
+                        api_category_id = resolve_app_category_id(category_id)
+                        if not api_category_id:
+                            self.log_msg.emit(
+                                f"⚠️ {rel_name}: неизвестный ID категории '{category_id}'. Поле пропущено."
+                            )
+                            continue
+                        relationships[rel_name] = {
+                            "data": {"type": "appCategories", "id": api_category_id}
+                        }
+                    attributes = {
+                        k: v for k, v in app_info_payload.items()
+                        if k not in APP_CATEGORY_RELATIONSHIP_FIELDS and v not in (None, "")
+                    }
+                    if attributes or relationships:
+                        try:
+                            client.update_app_info(app_info_id, attributes or None, relationships or None)
+                            self.log_msg.emit("✅ Обновлены category/возрастные и другие appInfo-поля.")
+                        except Exception as exc:
+                            self.log_msg.emit(
+                                f"⚠️ app_info (категории/kidsAgeBand) не обновлены: {exc}. "
+                                "Остальные метаданные продолжают загружаться."
+                            )
+                    else:
+                        self.log_msg.emit("⚠️ app_info: нет валидных полей для обновления.")
                     tick("Готово appInfo")
 
                 if app_info_localizations:
@@ -814,29 +1071,66 @@ class MetadataWorker(QThread):
                         locale = item.get("locale")
                         if not locale:
                             raise Exception("В app_info_localizations найдена запись без locale.")
-                        attributes = self._clean_attributes(item, self.APP_INFO_LOCALIZATION_FIELDS)
+                        attributes = sanitize_app_info_localization_attributes(
+                            self._clean_attributes(item, self.APP_INFO_LOCALIZATION_FIELDS),
+                            self.log_msg.emit,
+                        )
                         if not attributes:
                             self.log_msg.emit(f"[{locale}] Нет app info-полей для обновления, пропуск.")
                             tick(f"Пропуск {locale}")
                             continue
 
                         if locale in existing_by_locale:
-                            client.update_app_info_localization(existing_by_locale[locale], attributes)
-                            self.log_msg.emit(f"✅ [{locale}] Обновлены subtitle/privacy policy/name.")
+                            result = client.update_app_info_localization(
+                                existing_by_locale[locale], attributes
+                            )
+                            if result == "partial":
+                                self.log_msg.emit(
+                                    f"✅ [{locale}] Обновлены app info поля (часть пропущена Apple)."
+                                )
+                            else:
+                                self.log_msg.emit(f"✅ [{locale}] Обновлены subtitle/privacy policy/name.")
                         else:
                             client.create_app_info_localization(app_info_id, locale, attributes)
                             self.log_msg.emit(f"✅ [{locale}] Создана app info-локализация.")
                         tick(f"Готово {locale}")
 
+            app_store_version = self.metadata_config.get("app_store_version")
+            if app_store_version:
+                version_id = version_id or client.get_latest_app_store_version()
+                version_attributes = self._clean_attributes(
+                    app_store_version, self.APP_STORE_VERSION_FIELDS
+                )
+                if version_attributes:
+                    result = client.update_app_store_version(version_id, version_attributes)
+                    if result == "partial":
+                        self.log_msg.emit(
+                            "✅ Copyright: частично (поле недоступно в текущем статусе — проверьте в Connect)."
+                        )
+                    elif result == "skipped":
+                        self.log_msg.emit("⚠️ Copyright не обновлён — недоступен для этой версии.")
+                    else:
+                        self.log_msg.emit("✅ Обновлён copyright на уровне версии приложения.")
+                else:
+                    self.log_msg.emit("⚠️ app_store_version: нет поддерживаемых полей, пропуск.")
+                tick("Готово appStoreVersion")
+
             app_review_detail = self.metadata_config.get("app_review_detail")
             if app_review_detail:
                 version_id = locals().get("version_id") or client.get_latest_app_store_version()
-                attributes = self._clean_attributes(app_review_detail, self.APP_REVIEW_DETAIL_FIELDS)
+                existing_detail = client.get_app_review_detail(version_id)
+                existing_attrs = existing_detail.get("attributes", {}) if existing_detail else {}
+                source_attrs = self._clean_attributes(app_review_detail, self.APP_REVIEW_DETAIL_FIELDS)
+                attributes, missing = prepare_app_review_detail_attributes(source_attrs, existing_attrs)
                 if not attributes:
                     self.log_msg.emit("В app_review_detail нет поддерживаемых полей, пропуск.")
                     tick("Пропуск review detail")
+                elif missing:
+                    raise Exception(
+                        "App Review: обязательны contactEmail и contactPhone "
+                        f"(формат телефона: +1 555 010 0611). Не заполнено: {', '.join(missing)}"
+                    )
                 else:
-                    existing_detail = client.get_app_review_detail(version_id)
                     if existing_detail:
                         client.update_app_review_detail(existing_detail["id"], attributes)
                         self.log_msg.emit("✅ Обновлены App Review notes/contact/demo account.")
@@ -1002,14 +1296,27 @@ class GeminiMetadataWorker(QThread):
     def run(self):
         try:
             self.log_msg.emit("Gemini: генерирую ASO-метаданные...")
+            single_field_hints = {
+                "description": 'Return JSON with ONLY non-empty key "description". Other keys = "".',
+                "keywords": 'Return JSON with ONLY non-empty key "keywords". Other keys = "".',
+                "subtitle": 'Return JSON with ONLY non-empty key "subtitle". Other keys = "".',
+                "promotional_text": 'Return JSON with ONLY non-empty key "promotionalText". Other keys = "".',
+                "whats_new": 'Return JSON with ONLY non-empty key "whatsNew". Other keys = "".',
+                "review_notes": 'Return JSON with ONLY non-empty key "reviewNotes". Other keys = "".',
+                "category": 'Return JSON with primaryCategory, secondaryCategory, categoryName. Other text keys = "".',
+            }
+            field_hint = single_field_hints.get(
+                self.generation_mode,
+                "Fill all relevant keys for a complete metadata draft."
+            )
             prompt = f"""
 Generate App Store metadata for locale {self.locale}.
 Generation mode: {self.generation_mode}.
+Field focus: {field_hint}
 Current value to rewrite or shorten if relevant:
 {self.current_value or "Not provided"}
 Return only valid JSON without markdown.
 Do not generate or change the app name. The app name is entered manually by the user.
-For single-field modes, return only the requested field plus categoryName if category rationale is needed.
 Use this exact JSON schema:
 {{
   "subtitle": "max 30 chars",
@@ -1585,15 +1892,25 @@ class MainWindow(QWidget):
         self.meta_promotional_text_input.setPlaceholderText("Promotional text")
         self.meta_whats_new_input = QTextEdit()
         self.meta_whats_new_input.setFixedHeight(80)
-        self.meta_whats_new_input.setPlaceholderText("Release notes / What's New")
+        self.meta_whats_new_input.setPlaceholderText(
+            "Только для обновлений (1.0.1+). Первая версия — оставьте пустым."
+        )
+        self.meta_include_whats_new_checkbox = QCheckBox("Отправлять What's New в Apple")
+        self.meta_include_whats_new_checkbox.setChecked(False)
+        self.meta_include_whats_new_checkbox.setToolTip(
+            "Для первого релиза (1.0.0) в App Store Connect нет What's New — не включайте."
+        )
         self.meta_support_url_input = QLineEdit()
         self.meta_support_url_input.setPlaceholderText("https://example.com/support")
         self.meta_marketing_url_input = QLineEdit()
         self.meta_marketing_url_input.setPlaceholderText("https://example.com")
-        version_form.addRow("Description:", self.meta_description_input)
-        version_form.addRow("Keywords:", self.meta_keywords_input)
-        version_form.addRow("Promotional text:", self.meta_promotional_text_input)
-        version_form.addRow("What's New / notes:", self.meta_whats_new_input)
+        if not hasattr(self, "ai_field_buttons"):
+            self.ai_field_buttons = []
+        self._add_metadata_field_row(version_form, "Description:", self.meta_description_input, "description")
+        self._add_metadata_field_row(version_form, "Keywords:", self.meta_keywords_input, "keywords")
+        self._add_metadata_field_row(version_form, "Promotional text:", self.meta_promotional_text_input, "promotional_text")
+        self._add_metadata_field_row(version_form, "What's New:", self.meta_whats_new_input, "whats_new")
+        version_form.addRow("", self.meta_include_whats_new_checkbox)
         version_form.addRow("Support URL:", self.meta_support_url_input)
         version_form.addRow("Marketing URL:", self.meta_marketing_url_input)
         metadata_form_layout.addWidget(version_group)
@@ -1619,12 +1936,12 @@ class MainWindow(QWidget):
         self.meta_kids_age_band_input = QLineEdit()
         self.meta_kids_age_band_input.setPlaceholderText("По умолчанию 4+ / без ограничений")
         app_info_form.addRow("Name:", self.meta_name_input)
-        app_info_form.addRow("Subtitle:", self.meta_subtitle_input)
+        self._add_metadata_field_row(app_info_form, "Subtitle:", self.meta_subtitle_input, "subtitle")
         app_info_form.addRow("Copyright:", self.meta_copyright_input)
         app_info_form.addRow("Privacy Policy URL:", self.meta_privacy_policy_url_input)
         app_info_form.addRow("Privacy Choices URL:", self.meta_privacy_choices_url_input)
-        app_info_form.addRow("Primary Category:", self.meta_primary_category_input)
-        app_info_form.addRow("Secondary Category:", self.meta_secondary_category_input)
+        self._add_metadata_field_row(app_info_form, "Primary Category:", self.meta_primary_category_input, "category")
+        self._add_metadata_field_row(app_info_form, "Secondary Category:", self.meta_secondary_category_input, "category")
         app_info_form.addRow("Age rating default:", self.meta_kids_age_band_input)
         metadata_form_layout.addWidget(app_info_group)
 
@@ -1633,6 +1950,7 @@ class MainWindow(QWidget):
         self.meta_review_first_name_input = QLineEdit()
         self.meta_review_last_name_input = QLineEdit()
         self.meta_review_phone_input = QLineEdit()
+        self.meta_review_phone_input.setPlaceholderText("+1 555 010 0611")
         self.meta_review_email_input = QLineEdit()
         self.meta_demo_required_checkbox = QCheckBox("Демо-аккаунт нужен")
         self.meta_demo_user_input = QLineEdit()
@@ -1646,7 +1964,7 @@ class MainWindow(QWidget):
         review_form.addRow("Demo account:", self.meta_demo_required_checkbox)
         review_form.addRow("Demo login:", self.meta_demo_user_input)
         review_form.addRow("Demo password:", self.meta_demo_password_input)
-        review_form.addRow("Notes:", self.meta_review_notes_input)
+        self._add_metadata_field_row(review_form, "Notes:", self.meta_review_notes_input, "review_notes")
         metadata_form_layout.addWidget(review_group)
 
         ai_group = QGroupBox("AI генерация (Gemini)")
@@ -2072,6 +2390,22 @@ class MainWindow(QWidget):
             return str(value).strip() if value is not None else widget.currentText().strip()
         return widget.text().strip()
 
+    def _add_metadata_field_row(self, form_layout, label, widget, ai_mode):
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.addWidget(widget, stretch=1)
+        ai_button = QToolButton()
+        ai_button.setText("✨")
+        ai_button.setToolTip(f"Сгенерировать только это поле ({label.strip(':')})")
+        ai_button.setFixedSize(34, 34)
+        ai_button.clicked.connect(lambda _, mode=ai_mode: self._generate_ai_metadata(mode))
+        if not hasattr(self, "ai_field_buttons"):
+            self.ai_field_buttons = []
+        self.ai_field_buttons.append(ai_button)
+        row_layout.addWidget(ai_button)
+        form_layout.addRow(label, row_widget)
+
     def _apply_developer_name_to_review_fields(self):
         developer_name = self._line_text(self.ai_developer_name_input)
         if not developer_name:
@@ -2188,7 +2522,10 @@ class MainWindow(QWidget):
 
         self.meta_name_input.setText(app_info_item.get("name", ""))
         self.meta_subtitle_input.setText(app_info_item.get("subtitle", ""))
-        self.meta_copyright_input.setText(app_info_item.get("copyright", ""))
+        app_store_version = metadata_config.get("app_store_version", {})
+        self.meta_copyright_input.setText(
+            app_store_version.get("copyright") or app_info_item.get("copyright", "")
+        )
         self.meta_privacy_policy_url_input.setText(app_info_item.get("privacyPolicyUrl", ""))
         self.meta_privacy_choices_url_input.setText(app_info_item.get("privacyChoicesUrl", ""))
         self._set_combo_data(self.meta_primary_category_input, app_info.get("primaryCategory", ""))
@@ -2217,7 +2554,6 @@ class MainWindow(QWidget):
                     "promotionalText": "Short promo text",
                     "supportUrl": "https://example.com/support",
                     "marketingUrl": "https://example.com",
-                    "whatsNew": "Initial release notes"
                 }
             ],
             "app_info_localizations": [
@@ -2225,7 +2561,6 @@ class MainWindow(QWidget):
                     "locale": "en-US",
                     "name": "App Name",
                     "subtitle": "Short subtitle",
-                    "copyright": "© Your Developer Name",
                     "privacyPolicyUrl": "https://example.com/privacy",
                     "privacyChoicesUrl": "https://example.com/privacy-choices"
                 }
@@ -2234,6 +2569,9 @@ class MainWindow(QWidget):
                 "primaryCategory": "6016",
                 "secondaryCategory": "",
                 "kidsAgeBand": ""
+            },
+            "app_store_version": {
+                "copyright": "© Your Developer Name"
             },
             "app_review_detail": {
                 "contactFirstName": "John",
@@ -2250,6 +2588,7 @@ class MainWindow(QWidget):
 
     def _build_metadata_config_from_gui(self):
         locale = self.meta_locale_combo.currentData()
+        include_whats_new = self.meta_include_whats_new_checkbox.isChecked()
         version_item = {
             "locale": locale,
             "description": self._text_edit_text(self.meta_description_input),
@@ -2257,19 +2596,26 @@ class MainWindow(QWidget):
             "promotionalText": self._text_edit_text(self.meta_promotional_text_input),
             "supportUrl": self._line_text(self.meta_support_url_input),
             "marketingUrl": self._line_text(self.meta_marketing_url_input),
-            "whatsNew": self._text_edit_text(self.meta_whats_new_input)
         }
+        if include_whats_new:
+            whats_new_text = self._text_edit_text(self.meta_whats_new_input)
+            if whats_new_text:
+                version_item["whatsNew"] = whats_new_text
         version_item = {k: v for k, v in version_item.items() if k == "locale" or v}
 
         app_info_item = {
             "locale": locale,
             "name": self._line_text(self.meta_name_input),
             "subtitle": self._line_text(self.meta_subtitle_input),
-            "copyright": self._line_text(self.meta_copyright_input),
             "privacyPolicyUrl": self._line_text(self.meta_privacy_policy_url_input),
             "privacyChoicesUrl": self._line_text(self.meta_privacy_choices_url_input)
         }
         app_info_item = {k: v for k, v in app_info_item.items() if k == "locale" or v}
+
+        app_store_version = {}
+        copyright_text = self._line_text(self.meta_copyright_input)
+        if copyright_text:
+            app_store_version["copyright"] = copyright_text
 
         app_info = {
             "primaryCategory": self._line_text(self.meta_primary_category_input),
@@ -2277,23 +2623,29 @@ class MainWindow(QWidget):
             "kidsAgeBand": self._line_text(self.meta_kids_age_band_input)
         }
         valid_category_ids = {cat_id for cat_id, _ in APP_CATEGORY_OPTIONS if cat_id}
+        valid_category_ids.update(ITUNES_GENRE_TO_APP_CATEGORY.values())
         for field in ("primaryCategory", "secondaryCategory"):
             cat_id = app_info.get(field)
-            if cat_id and cat_id not in valid_category_ids:
+            if cat_id and cat_id not in valid_category_ids and not resolve_app_category_id(cat_id):
                 self._log(f"⚠️ {field} '{cat_id}' не найден в списке App Store категорий. Поле будет пропущено.")
                 app_info[field] = ""
+        primary = resolve_app_category_id(app_info.get("primaryCategory", ""))
+        secondary = resolve_app_category_id(app_info.get("secondaryCategory", ""))
+        if primary and secondary and primary == secondary:
+            self._log("⚠️ Primary и Secondary category совпадают. Secondary будет пропущена.")
+            app_info["secondaryCategory"] = ""
         app_info = {k: v for k, v in app_info.items() if v}
 
         app_review_detail = {
             "contactFirstName": self._line_text(self.meta_review_first_name_input),
             "contactLastName": self._line_text(self.meta_review_last_name_input),
-            "contactPhone": self._line_text(self.meta_review_phone_input),
+            "contactPhone": normalize_review_phone(self._line_text(self.meta_review_phone_input)),
             "contactEmail": self._line_text(self.meta_review_email_input),
             "demoAccountName": self._line_text(self.meta_demo_user_input),
             "demoAccountPassword": self._line_text(self.meta_demo_password_input),
             "notes": self._text_edit_text(self.meta_review_notes_input)
         }
-        app_review_detail = {k: v for k, v in app_review_detail.items() if v}
+        app_review_detail = {k: v for k, v in app_review_detail.items() if v not in (None, "")}
         if app_review_detail or self.meta_demo_required_checkbox.isChecked():
             app_review_detail["demoAccountRequired"] = self.meta_demo_required_checkbox.isChecked()
 
@@ -2309,10 +2661,14 @@ class MainWindow(QWidget):
         metadata_config = {}
         if len(version_item) > 1:
             metadata_config["version_localizations"] = [version_item]
+        if include_whats_new:
+            metadata_config["include_whats_new"] = True
         if len(app_info_item) > 1:
             metadata_config["app_info_localizations"] = [app_info_item]
         if app_info:
             metadata_config["app_info"] = app_info
+        if app_store_version:
+            metadata_config["app_store_version"] = app_store_version
         if app_review_detail:
             metadata_config["app_review_detail"] = app_review_detail
         if custom_requests:
@@ -2396,8 +2752,39 @@ class MainWindow(QWidget):
             ("Marketing URL", self._line_text(self.meta_marketing_url_input)),
             ("Privacy Policy URL", self._line_text(self.meta_privacy_policy_url_input)),
         ]:
-            if url_value and not url_value.startswith("https://"):
-                results.append(f"⚠️ {url_label} лучше начинать с https://")
+            if url_value and not url_value.startswith(("http://", "https://")):
+                results.append(f"⚠️ {url_label} лучше начинать с https:// (будет добавлено автоматически)")
+
+        app_name = self._line_text(self.meta_name_input)
+        if app_name:
+            self._check_length("App name", app_name, 30, results)
+        copyright_text = self._line_text(self.meta_copyright_input)
+        if copyright_text:
+            results.append(f"✅ Copyright: {len(copyright_text)} chars (уровень версии, не локаль)")
+        phone = self._line_text(self.meta_review_phone_input)
+        if phone:
+            normalized_phone = normalize_review_phone(phone)
+            if normalized_phone != phone.strip():
+                results.append(f"⚠️ Телефон будет нормализован: {normalized_phone}")
+            else:
+                results.append(f"✅ Contact phone: {normalized_phone}")
+        email = self._line_text(self.meta_review_email_input)
+        if email and "@" not in email:
+            results.append("⚠️ Contact email выглядит некорректно")
+        elif email:
+            results.append(f"✅ Contact email: {email}")
+        if self.meta_demo_required_checkbox.isChecked():
+            if not self._line_text(self.meta_demo_user_input) or not self._line_text(self.meta_demo_password_input):
+                results.append("❌ Demo account: нужны login и password")
+            else:
+                results.append("✅ Demo account: login/password указаны")
+        kids_band = self._line_text(self.meta_kids_age_band_input)
+        if kids_band and kids_band not in {"", "FIVE_AND_UNDER", "SIX_TO_EIGHT", "NINE_TO_ELEVEN"}:
+            results.append(
+                f"⚠️ kidsAgeBand '{kids_band}' неверный — используйте FIVE_AND_UNDER / SIX_TO_EIGHT / NINE_TO_ELEVEN"
+            )
+        if not self.meta_include_whats_new_checkbox.isChecked():
+            results.append("ℹ️ What's New не будет отправлен (первая версия / галочка выключена)")
 
         for line in results:
             self._log(line)
@@ -2480,10 +2867,23 @@ class MainWindow(QWidget):
             self._log(f"Ошибка сохранения .env файла: {e}")
 
     def _current_value_for_generation_mode(self, mode):
-        if mode == "rewrite_description":
+        if mode == "description" or mode == "rewrite_description":
             return self._text_edit_text(self.meta_description_input)
-        if mode == "shorten_keywords":
+        if mode == "keywords" or mode == "shorten_keywords":
             return self._line_text(self.meta_keywords_input)
+        if mode == "subtitle":
+            return self._line_text(self.meta_subtitle_input)
+        if mode == "promotional_text":
+            return self._text_edit_text(self.meta_promotional_text_input)
+        if mode == "whats_new":
+            return self._text_edit_text(self.meta_whats_new_input)
+        if mode == "review_notes":
+            return self._text_edit_text(self.meta_review_notes_input)
+        if mode == "category":
+            return json.dumps({
+                "primaryCategory": self._line_text(self.meta_primary_category_input),
+                "secondaryCategory": self._line_text(self.meta_secondary_category_input),
+            }, ensure_ascii=False)
         if mode == "shorten_to_limits":
             return json.dumps(self._build_metadata_config_from_gui(), ensure_ascii=False)
         if mode == "fix_banned_words":
@@ -2497,6 +2897,8 @@ class MainWindow(QWidget):
 
     def _set_ai_buttons_enabled(self, state):
         for button in getattr(self, "ai_generation_buttons", []):
+            button.setEnabled(state)
+        for button in getattr(self, "ai_field_buttons", []):
             button.setEnabled(state)
         for button in getattr(self, "ai_fix_buttons", []):
             button.setEnabled(state)
@@ -2522,12 +2924,23 @@ class MainWindow(QWidget):
         if not user_prompt:
             self._log("Ошибка: Вставьте промт генерации для Gemini.")
             return
-        if mode in ["rewrite_description", "shorten_keywords", "shorten_to_limits", "fix_banned_words"] and not current_value:
+        rewrite_modes = ["rewrite_description", "shorten_keywords", "shorten_to_limits", "fix_banned_words"]
+        if mode in rewrite_modes and not current_value:
             self._log("Ошибка: Для этого режима сначала заполните текущее поле, которое нужно переписать или сократить.")
             return
 
         self._set_ai_buttons_enabled(False)
-        self._log(f"Отправляю запрос в Gemini. Режим: {mode}")
+        mode_labels = {
+            "all": "все поля",
+            "description": "Description",
+            "keywords": "Keywords",
+            "subtitle": "Subtitle",
+            "promotional_text": "Promotional text",
+            "whats_new": "What's New",
+            "review_notes": "App Review notes",
+            "category": "Categories",
+        }
+        self._log(f"Отправляю запрос в Gemini. Режим: {mode_labels.get(mode, mode)}")
         self.gemini_worker = GeminiMetadataWorker(api_key, model, locale, app_context, user_prompt, developer_name, mode, current_value)
         self.gemini_worker.log_msg.connect(self._log)
         self.gemini_worker.metadata_generated.connect(self._apply_ai_metadata)
@@ -2535,6 +2948,42 @@ class MainWindow(QWidget):
         self.gemini_worker.start()
 
     def _apply_ai_metadata(self, metadata):
+        mode = getattr(self.gemini_worker, "generation_mode", "all")
+        single_field_modes = {
+            "description", "keywords", "subtitle", "promotional_text", "whats_new", "review_notes", "category",
+            "rewrite_description", "shorten_keywords",
+        }
+
+        if mode in single_field_modes:
+            if mode in ("description", "rewrite_description") and metadata.get("description"):
+                self.meta_description_input.setPlainText(str(metadata.get("description", ""))[:4000])
+                self._log("✅ Description обновлён.")
+            elif mode in ("keywords", "shorten_keywords") and metadata.get("keywords"):
+                self.meta_keywords_input.setText(str(metadata.get("keywords", ""))[:100])
+                self._log("✅ Keywords обновлены.")
+            elif mode == "subtitle" and metadata.get("subtitle"):
+                self.meta_subtitle_input.setText(str(metadata.get("subtitle", ""))[:30])
+                self._log("✅ Subtitle обновлён.")
+            elif mode == "promotional_text" and metadata.get("promotionalText"):
+                self.meta_promotional_text_input.setPlainText(str(metadata.get("promotionalText", ""))[:170])
+                self._log("✅ Promotional text обновлён.")
+            elif mode == "whats_new" and metadata.get("whatsNew"):
+                self.meta_whats_new_input.setPlainText(str(metadata.get("whatsNew", "")))
+                self._log("✅ What's New обновлён.")
+            elif mode == "review_notes" and metadata.get("reviewNotes"):
+                self.meta_review_notes_input.setPlainText(str(metadata.get("reviewNotes", "")))
+                self._log("✅ App Review notes обновлены.")
+            elif mode == "category":
+                if metadata.get("primaryCategory"):
+                    self._set_combo_data(self.meta_primary_category_input, str(metadata.get("primaryCategory", "")))
+                if metadata.get("secondaryCategory"):
+                    self._set_combo_data(self.meta_secondary_category_input, str(metadata.get("secondaryCategory", "")))
+                self._log("✅ Categories обновлены.")
+            category_name = metadata.get("categoryName")
+            if category_name:
+                self._log(f"Gemini предлагает категорию: {category_name}. Проверьте category ID перед отправкой.")
+            return
+
         if metadata.get("subtitle"):
             self.meta_subtitle_input.setText(str(metadata.get("subtitle", ""))[:30])
         if metadata.get("description"):
