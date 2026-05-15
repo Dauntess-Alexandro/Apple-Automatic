@@ -1079,6 +1079,94 @@ class AutomationWorker(QThread):
         finally:
             self.finished.emit()
 
+class RefreshLocalesWorker(QThread):
+    log_msg = Signal(str)
+    locales_fetched = Signal(list)
+    finished = Signal()
+
+    def __init__(self, api_creds):
+        super().__init__()
+        self.api_creds = api_creds
+
+    def run(self):
+        try:
+            client = ASCClient(
+                self.api_creds["issuer"], self.api_creds["key_id"],
+                self.api_creds["p8_path"], self.api_creds["app_id"], self.log_msg.emit
+            )
+            version_id = client.get_latest_app_store_version()
+            records = client.get_version_localization_records(version_id)
+            locales = [item.get("attributes", {}).get("locale") for item in records if item.get("attributes", {}).get("locale")]
+            self.locales_fetched.emit(locales)
+            self.log_msg.emit(f"✅ Активных локалей найдено: {len(locales)}")
+        except Exception as e:
+            self.log_msg.emit(f"Ошибка обновления локалей: {str(e)}")
+        finally:
+            self.finished.emit()
+
+class ScreenshotUploadWorker(QThread):
+    log_msg = Signal(str)
+    progress_update = Signal(int, str)
+    finished = Signal()
+
+    def __init__(self, api_creds, target_locales, jpeg_files):
+        super().__init__()
+        self.api_creds = api_creds
+        self.target_locales = target_locales
+        self.jpeg_files = jpeg_files
+
+    def run(self):
+        try:
+            client = ASCClient(
+                self.api_creds["issuer"], self.api_creds["key_id"],
+                self.api_creds["p8_path"], self.api_creds["app_id"], self.log_msg.emit
+            )
+            version_id = client.get_latest_app_store_version()
+            records = client.get_version_localization_records(version_id)
+            loc_to_id = {item["attributes"]["locale"]: item["id"] for item in records if item.get("attributes", {}).get("locale")}
+            total_steps = max(1, len(self.target_locales) * len(self.jpeg_files))
+            done = 0
+
+            for locale in self.target_locales:
+                if locale not in loc_to_id:
+                    self.log_msg.emit(f"[{locale}] Локаль не открыта, создаем...")
+                    loc_to_id[locale] = client.create_version_localization(version_id, locale, {})
+                    time.sleep(0.5)
+                localization_id = loc_to_id[locale]
+                self.log_msg.emit(f"[{locale}] Подготовка screenshot set APP_IPHONE_67...")
+                sets = client._request("GET", f"appStoreVersionLocalizations/{localization_id}/appScreenshotSets").get("data", [])
+                target_set = next((s for s in sets if s.get("attributes", {}).get("screenshotDisplayType") == "APP_IPHONE_67"), None)
+                if target_set is None:
+                    payload = {
+                        "data": {
+                            "type": "appScreenshotSets",
+                            "attributes": {"screenshotDisplayType": "APP_IPHONE_67"},
+                            "relationships": {
+                                "appStoreVersionLocalization": {
+                                    "data": {"type": "appStoreVersionLocalizations", "id": localization_id}
+                                }
+                            }
+                        }
+                    }
+                    target_set_id = client._request("POST", "appScreenshotSets", payload)["data"]["id"]
+                else:
+                    target_set_id = target_set["id"]
+
+                for idx, file_path in enumerate(self.jpeg_files, start=1):
+                    file_name = f"{idx}_{os.path.basename(file_path)}"
+                    self.log_msg.emit(f"[{locale}] Upload {idx}/{len(self.jpeg_files)}: {file_name}")
+                    client.upload_screenshot(target_set_id, file_path, file_name)
+                    done += 1
+                    percent = int((done / total_steps) * 100)
+                    self.progress_update.emit(percent, f"Загрузка: {percent}%")
+                    time.sleep(1)
+
+            self.log_msg.emit("✅ Upload скриншотов завершен.")
+        except Exception as e:
+            self.log_msg.emit(f"Ошибка Upload: {str(e)}")
+        finally:
+            self.finished.emit()
+
 
 class MainWindow(QWidget):
     def __init__(self):
@@ -1355,10 +1443,13 @@ class MainWindow(QWidget):
         ai_layout.addLayout(ai_form)
         profile_buttons_layout = QHBoxLayout()
         self.btn_apply_prompt_profile = QPushButton("📌 Применить профиль")
+        self.btn_apply_prompt_profile.setObjectName("utility_btn")
         self.btn_apply_prompt_profile.clicked.connect(self._apply_prompt_profile)
         self.btn_save_prompt_profile = QPushButton("💾 Сохранить профиль")
+        self.btn_save_prompt_profile.setObjectName("utility_btn")
         self.btn_save_prompt_profile.clicked.connect(self._save_current_prompt_profile)
         self.btn_reset_ai_prompt = QPushButton("🧩 Вставить стандартный ASO промт")
+        self.btn_reset_ai_prompt.setObjectName("utility_btn")
         self.btn_reset_ai_prompt.clicked.connect(lambda: self.ai_prompt_input.setPlainText(DEFAULT_GEMINI_PROMPT))
         profile_buttons_layout.addWidget(self.btn_apply_prompt_profile)
         profile_buttons_layout.addWidget(self.btn_save_prompt_profile)
@@ -1368,20 +1459,17 @@ class MainWindow(QWidget):
         ai_buttons_grid = QGridLayout()
         ai_actions = [
             ("✨ Сгенерировать все", "all"),
-            ("📝 Генерация описания", "description"),
-            ("🔑 Генерация ключевых слов", "keywords"),
-            ("🏷️ Генерация подзаголовка", "subtitle"),
-            ("📚 Генерация категории", "category"),
-            ("🧐 Генерация обзорных заметок", "review_notes"),
-            ("✍️ Переписать описание", "rewrite_description"),
-            ("✂️ Сократить ключевые слова", "shorten_keywords"),
         ]
         self.ai_generation_buttons = []
         for index, (label, mode) in enumerate(ai_actions):
             button = QPushButton(label)
+            if mode == "all":
+                button.setObjectName("main_generate_btn")
+                button.setMinimumHeight(50)
             button.clicked.connect(lambda _, m=mode: self._generate_ai_metadata(m))
             self.ai_generation_buttons.append(button)
-            ai_buttons_grid.addWidget(button, index // 2, index % 2)
+            ai_buttons_grid.addWidget(button, index, 0)
+        ai_buttons_grid.setColumnStretch(0, 1)
         ai_layout.addLayout(ai_buttons_grid)
 
         fix_group = QGroupBox("Fix with AI / quick fixes")
@@ -1398,6 +1486,8 @@ class MainWindow(QWidget):
             button.clicked.connect(lambda _, m=mode: self._run_fix_action(m))
             self.ai_fix_buttons.append(button)
             fix_grid.addWidget(button, index // 2, index % 2)
+        fix_grid.setColumnStretch(0, 1)
+        fix_grid.setColumnStretch(1, 1)
         ai_layout.addWidget(fix_group)
         metadata_form_layout.addWidget(ai_group)
 
@@ -1413,6 +1503,48 @@ class MainWindow(QWidget):
         metadata_scroll.setWidget(metadata_widget)
         metadata_layout.addWidget(metadata_scroll)
         self.tabs.addTab(self.tab_metadata, "🧾 ПЕРВИЧНАЯ ЗАГРУЗКА")
+        self.tab_screens_upload = QWidget()
+        screens_upload_layout = QVBoxLayout(self.tab_screens_upload)
+        screens_upload_layout.addWidget(QLabel("Загрузка скринов (.jpeg) в App Store Connect на target 6.9 inch."))
+        self.btn_refresh_locales = QPushButton("🔄 Обновить локали")
+        self.btn_refresh_locales.clicked.connect(self._refresh_screenshot_locales)
+        screens_upload_layout.addWidget(self.btn_refresh_locales)
+
+        upload_scroll = QScrollArea()
+        upload_scroll.setWidgetResizable(True)
+        upload_scroll_widget = QWidget()
+        upload_grid = QGridLayout(upload_scroll_widget)
+        self.upload_locale_checkboxes = []
+        sorted_locales = sorted(LOCALE_MAP.items(), key=lambda item: item[1][1])
+        row, col = 0, 0
+        for code, (cc, name) in sorted_locales:
+            cb = QCheckBox(f" {name}")
+            cb.setProperty("locale_code", code)
+            icon_path = f".flags_cache/{cc}.png"
+            if os.path.exists(icon_path):
+                cb.setIcon(QIcon(icon_path))
+                cb.setIconSize(QSize(20, 15))
+            self.upload_locale_checkboxes.append(cb)
+            upload_grid.addWidget(cb, row, col)
+            col += 1
+            if col > 3:
+                col = 0
+                row += 1
+        upload_scroll.setWidget(upload_scroll_widget)
+        screens_upload_layout.addWidget(upload_scroll)
+
+        files_layout = QHBoxLayout()
+        self.btn_select_jpegs = QPushButton("📎 Выбрать .jpeg файлы")
+        self.btn_select_jpegs.clicked.connect(self._select_jpeg_files)
+        self.lbl_selected_jpegs = QLabel("Файлы не выбраны")
+        files_layout.addWidget(self.btn_select_jpegs)
+        files_layout.addWidget(self.lbl_selected_jpegs, stretch=1)
+        screens_upload_layout.addLayout(files_layout)
+        self.upload_jpeg_files = []
+        self.btn_execute_upload = QPushButton("⬆️ Upload")
+        self.btn_execute_upload.clicked.connect(self._start_screenshot_upload)
+        screens_upload_layout.addWidget(self.btn_execute_upload)
+        self.tabs.addTab(self.tab_screens_upload, "🖼️ ЗАГРУЗКА СКРИНОВ")
 
         self.tab_privacy = QWidget()
         privacy_layout = QVBoxLayout(self.tab_privacy)
@@ -1530,6 +1662,21 @@ class MainWindow(QWidget):
             }
             QPushButton#start_btn:hover { background-color: #00ED00; }
             QPushButton#start_btn:disabled { background-color: #2D2D30; color: #7A7A7A; }
+
+            QPushButton#utility_btn {
+                padding: 6px;
+                font-size: 12px;
+                color: #D4D4D4;
+            }
+            QPushButton#main_generate_btn {
+                background-color: #00D100;
+                color: #050805;
+                font-size: 15px;
+                border: none;
+                font-weight: 700;
+            }
+            QPushButton#main_generate_btn:hover { background-color: #00ED00; }
+            QPushButton#main_generate_btn:disabled { background-color: #2D2D30; color: #7A7A7A; }
             
             QLineEdit, QTextEdit, QComboBox { 
                 background-color: #252526; 
@@ -1994,6 +2141,8 @@ class MainWindow(QWidget):
             self.start_btn.setText("🚀 ОБНОВИТЬ ВЫБРАННЫЕ ДАННЫЕ В ТЕСТЕ")
         elif index == 2:
             self.start_btn.setText("🚀 ЗАГРУЗИТЬ МЕТАДАННЫЕ ПРИЛОЖЕНИЯ")
+        elif index == 3:
+            self.start_btn.setText("⬆️ ЗАГРУЗКА СКРИНОВ: используйте кнопку в табе")
         else:
             self.start_btn.setText("🔐 PREVIEW APP PRIVACY")
 
@@ -2196,6 +2345,62 @@ class MainWindow(QWidget):
             self.update_name_combo.addItems(exp_names)
         else:
             self._log("В текущей версии приложения нет созданных тестов.")
+
+    def _refresh_screenshot_locales(self):
+        self._save_env_to_file()
+        api_creds = {
+            "issuer": self.issuer_input.text().strip(),
+            "key_id": self.key_input.text().strip(),
+            "app_id": self.app_input.text().strip(),
+            "p8_path": self.p8_path_input.text().strip()
+        }
+        if not all(api_creds.values()):
+            self._log("Ошибка: Заполните все настройки API для обновления локалей.")
+            return
+        self.btn_refresh_locales.setEnabled(False)
+        self.locale_refresh_worker = RefreshLocalesWorker(api_creds)
+        self.locale_refresh_worker.log_msg.connect(self._log)
+        self.locale_refresh_worker.locales_fetched.connect(self._apply_active_screenshot_locales)
+        self.locale_refresh_worker.finished.connect(lambda: self.btn_refresh_locales.setEnabled(True))
+        self.locale_refresh_worker.start()
+
+    def _apply_active_screenshot_locales(self, active_locales):
+        active = set(active_locales)
+        for cb in self.upload_locale_checkboxes:
+            cb.setChecked(cb.property("locale_code") in active)
+
+    def _select_jpeg_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Выберите .jpeg файлы", "", "JPEG Files (*.jpeg *.jpg)")
+        if files:
+            self.upload_jpeg_files = sorted([f for f in files if f.lower().endswith((".jpeg", ".jpg"))])
+            self.lbl_selected_jpegs.setText(f"Выбрано файлов: {len(self.upload_jpeg_files)}")
+
+    def _start_screenshot_upload(self):
+        self._save_env_to_file()
+        api_creds = {
+            "issuer": self.issuer_input.text().strip(),
+            "key_id": self.key_input.text().strip(),
+            "app_id": self.app_input.text().strip(),
+            "p8_path": self.p8_path_input.text().strip()
+        }
+        if not all(api_creds.values()):
+            self._log("Ошибка: Заполните все поля в разделе НАСТРОЙКИ API.")
+            return
+        target_locales = [cb.property("locale_code") for cb in self.upload_locale_checkboxes if cb.isChecked()]
+        if not target_locales:
+            self._log("Ошибка: Выберите хотя бы одну локаль для загрузки скринов.")
+            return
+        if not self.upload_jpeg_files:
+            self._log("Ошибка: Выберите хотя бы один .jpeg файл.")
+            return
+        self.btn_execute_upload.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.time_label.setText("Загрузка: 0%")
+        self.screenshot_upload_worker = ScreenshotUploadWorker(api_creds, target_locales, self.upload_jpeg_files)
+        self.screenshot_upload_worker.log_msg.connect(self._log)
+        self.screenshot_upload_worker.progress_update.connect(self._update_progress)
+        self.screenshot_upload_worker.finished.connect(lambda: self.btn_execute_upload.setEnabled(True))
+        self.screenshot_upload_worker.start()
 
     def _start_process(self):
         self._save_env_to_file()
