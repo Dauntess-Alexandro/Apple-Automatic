@@ -368,6 +368,77 @@ class ASCClient:
     def run_custom_request(self, method, endpoint, payload=None):
         return self._request(method.upper(), endpoint.lstrip("/"), payload)
 
+    def get_app_data_usages(self):
+        endpoint = f"apps/{self.app_id}/dataUsages?include=category,purpose,dataProtection&limit=200"
+        data = self._request("GET", endpoint)
+        return data.get("data", []) if data else []
+
+    def delete_app_data_usage(self, usage_id):
+        self._request("DELETE", f"appDataUsages/{usage_id}")
+
+    def create_app_data_usage(self, category_id=None, purpose_id=None, protection_id=None):
+        relationships = {
+            "app": {"data": {"type": "apps", "id": self.app_id}}
+        }
+        if category_id:
+            relationships["category"] = {"data": {"type": "appDataUsageCategories", "id": category_id}}
+        if protection_id:
+            relationships["dataProtection"] = {"data": {"type": "appDataUsageDataProtections", "id": protection_id}}
+        if purpose_id:
+            relationships["purpose"] = {"data": {"type": "appDataUsagePurposes", "id": purpose_id}}
+        payload = {"data": {"type": "appDataUsages", "relationships": relationships}}
+        return self._request("POST", "appDataUsages", payload)
+
+    def get_data_usage_publish_state(self):
+        data = self._request("GET", f"apps/{self.app_id}/dataUsagePublishState")
+        return data.get("data") if data else None
+
+    def publish_data_usages(self):
+        state = self.get_data_usage_publish_state()
+        if not state:
+            raise Exception("Не найден dataUsagePublishState для приложения.")
+        if state.get("attributes", {}).get("published"):
+            return False
+        state_id = state["id"]
+        payload = {
+            "data": {
+                "type": "appDataUsagesPublishState",
+                "id": state_id,
+                "attributes": {"published": True}
+            }
+        }
+        self._request("PATCH", f"appDataUsagesPublishState/{state_id}", payload)
+        return True
+
+    def sync_app_privacy_details(self, usages_config, publish=True):
+        existing = self.get_app_data_usages()
+        for item in existing:
+            self.delete_app_data_usage(item["id"])
+        self.logger(f"Удалено старых записей App Privacy: {len(existing)}")
+
+        created = 0
+        for usage_config in usages_config:
+            category = usage_config.get("category")
+            purposes = usage_config.get("purposes") or []
+            data_protections = usage_config.get("data_protections") or []
+            if not data_protections:
+                continue
+            if not purposes:
+                purposes = [None]
+            for purpose in purposes:
+                for protection in data_protections:
+                    label = f"{category or 'N/A'} / {purpose or 'N/A'} / {protection}"
+                    self.logger(f"Создаю App Privacy: {label}")
+                    self.create_app_data_usage(category, purpose, protection)
+                    created += 1
+
+        if publish:
+            if self.publish_data_usages():
+                self.logger("App Privacy опубликована в App Store Connect.")
+            else:
+                self.logger("App Privacy уже была опубликована.")
+        return created
+
     def get_experiments(self, version_id):
         endpoint = f"appStoreVersions/{version_id}/appStoreVersionExperiments"
         res = self._request("GET", endpoint)
@@ -684,6 +755,38 @@ class MetadataWorker(QThread):
         except Exception as e:
             self.progress_update.emit(0, "Ошибка метаданных")
             self.log_msg.emit(f"КРИТИЧЕСКАЯ ОШИБКА МЕТАДАННЫХ: {str(e)}")
+        finally:
+            self.finished.emit()
+
+
+class AppPrivacyWorker(QThread):
+    log_msg = Signal(str)
+    progress_update = Signal(int, str)
+    finished = Signal()
+
+    def __init__(self, api_creds, usages_config, publish=True):
+        super().__init__()
+        self.api_creds = api_creds
+        self.usages_config = usages_config
+        self.publish = publish
+
+    def run(self):
+        try:
+            self.progress_update.emit(5, "Подключение к App Store Connect...")
+            client = ASCClient(
+                self.api_creds["issuer"],
+                self.api_creds["key_id"],
+                self.api_creds["p8_path"],
+                self.api_creds["app_id"],
+                self.log_msg.emit
+            )
+            self.progress_update.emit(20, "Синхронизация App Privacy...")
+            created = client.sync_app_privacy_details(self.usages_config, publish=self.publish)
+            self.progress_update.emit(100, "App Privacy загружена")
+            self.log_msg.emit(f"=== APP PRIVACY ЗАГРУЖЕНА ({created} записей) ===")
+        except Exception as e:
+            self.progress_update.emit(0, "Ошибка App Privacy")
+            self.log_msg.emit(f"КРИТИЧЕСКАЯ ОШИБКА APP PRIVACY: {str(e)}")
         finally:
             self.finished.emit()
 
@@ -1548,10 +1651,11 @@ class MainWindow(QWidget):
 
         self.tab_privacy = QWidget()
         privacy_layout = QVBoxLayout(self.tab_privacy)
-        privacy_layout.addWidget(QLabel("App Privacy GUI: базовая декларация приватности для наших приложений"))
+        privacy_layout.addWidget(QLabel("App Privacy: загрузка декларации в App Store Connect (API appDataUsages)"))
         privacy_layout.addWidget(QLabel(
-            "По умолчанию заполнено: Device ID для Analytics, not tracking, not linked; "
-            "Crash Data для Analytics, tracking, not linked."
+            "По умолчанию: Device ID → Analytics, not tracking, not linked; "
+            "Crash Data → Analytics, tracking, not linked. "
+            "Нужны права Admin/Account Holder на API-ключ."
         ))
 
         privacy_defaults_group = QGroupBox("Data Types")
@@ -1576,17 +1680,22 @@ class MainWindow(QWidget):
         privacy_defaults_layout.addRow("Crash Data linked:", self.privacy_crash_data_linked)
         privacy_layout.addWidget(privacy_defaults_group)
 
+        self.privacy_publish_checkbox = QCheckBox("Опубликовать в App Store Connect после загрузки")
+        self.privacy_publish_checkbox.setChecked(True)
+        privacy_layout.addWidget(self.privacy_publish_checkbox)
+
         privacy_buttons_layout = QHBoxLayout()
-        self.btn_preview_privacy = QPushButton("🔍 Preview App Privacy")
+        self.btn_preview_privacy = QPushButton("🔍 Preview JSON")
         self.btn_preview_privacy.clicked.connect(self._preview_app_privacy)
-        self.btn_copy_privacy_to_custom = QPushButton("📋 Вставить draft в custom_requests")
-        self.btn_copy_privacy_to_custom.clicked.connect(self._copy_privacy_draft_to_custom_requests)
+        self.btn_upload_privacy = QPushButton("🔐 Загрузить в App Store Connect")
+        self.btn_upload_privacy.clicked.connect(self._upload_app_privacy)
         privacy_buttons_layout.addWidget(self.btn_preview_privacy)
-        privacy_buttons_layout.addWidget(self.btn_copy_privacy_to_custom)
+        privacy_buttons_layout.addWidget(self.btn_upload_privacy)
         privacy_layout.addLayout(privacy_buttons_layout)
 
         self.privacy_preview_text = QTextEdit()
         self.privacy_preview_text.setReadOnly(True)
+        self.privacy_preview_text.setMinimumHeight(140)
         privacy_layout.addWidget(self.privacy_preview_text)
         self.tabs.addTab(self.tab_privacy, "🔐 APP PRIVACY")
 
@@ -1750,42 +1859,72 @@ class MainWindow(QWidget):
         except Exception as e:
             self._log(f"Ошибка сохранения prompt profile: {e}")
 
-    def _app_privacy_payload(self):
-        data_types = []
+    def _app_privacy_config(self):
+        config = []
         if self.privacy_device_id_enabled.isChecked():
-            data_types.append({
-                "dataType": "DEVICE_ID",
+            protections = []
+            if self.privacy_device_id_linked.isChecked():
+                protections.append("DATA_LINKED_TO_YOU")
+            else:
+                protections.append("DATA_NOT_LINKED_TO_YOU")
+            if self.privacy_device_id_tracking.isChecked():
+                protections.append("DATA_USED_TO_TRACK_YOU")
+            config.append({
+                "category": "DEVICE_ID",
                 "purposes": ["ANALYTICS"],
-                "usedForTracking": self.privacy_device_id_tracking.isChecked(),
-                "linkedToUser": self.privacy_device_id_linked.isChecked()
+                "data_protections": sorted(set(protections))
             })
         if self.privacy_crash_data_enabled.isChecked():
-            data_types.append({
-                "dataType": "CRASH_DATA",
+            protections = []
+            if self.privacy_crash_data_linked.isChecked():
+                protections.append("DATA_LINKED_TO_YOU")
+            else:
+                protections.append("DATA_NOT_LINKED_TO_YOU")
+            if self.privacy_crash_data_tracking.isChecked():
+                protections.append("DATA_USED_TO_TRACK_YOU")
+            config.append({
+                "category": "CRASH_DATA",
                 "purposes": ["ANALYTICS"],
-                "usedForTracking": self.privacy_crash_data_tracking.isChecked(),
-                "linkedToUser": self.privacy_crash_data_linked.isChecked()
+                "data_protections": sorted(set(protections))
             })
-        return {
-            "note": "Draft App Privacy payload. Replace endpoint/id with the exact App Store Connect privacy resource before upload.",
-            "dataTypes": data_types
-        }
+        return config
 
     def _preview_app_privacy(self):
-        payload = self._app_privacy_payload()
-        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        config = self._app_privacy_config()
+        text = json.dumps(config, ensure_ascii=False, indent=2)
         self.privacy_preview_text.setPlainText(text)
-        self._log("App Privacy preview обновлен.")
+        self._log("App Privacy JSON (формат fastlane / App Store Connect API):")
+        self._log(text)
 
-    def _copy_privacy_draft_to_custom_requests(self):
-        payload = self._app_privacy_payload()
-        custom_request = [{
-            "method": "PATCH",
-            "endpoint": "APP_PRIVACY_ENDPOINT_REPLACE_BEFORE_UPLOAD",
-            "payload": payload
-        }]
-        self.metadata_text.setPlainText(json.dumps(custom_request, ensure_ascii=False, indent=2))
-        self._log("Draft App Privacy вставлен в custom_requests. Перед upload замените endpoint на реальный App Store Connect endpoint.")
+    def _upload_app_privacy(self):
+        self._save_env_to_file()
+        api_creds = {
+            "issuer": self.issuer_input.text().strip(),
+            "key_id": self.key_input.text().strip(),
+            "app_id": self.app_input.text().strip(),
+            "p8_path": self.p8_path_input.text().strip()
+        }
+        if not all(api_creds.values()):
+            self._log("Ошибка: Заполните все поля в разделе НАСТРОЙКИ API.")
+            return
+        usages_config = self._app_privacy_config()
+        if not usages_config:
+            self._log("Ошибка: Включите хотя бы один тип данных (Device ID или Crash Data).")
+            return
+        self._preview_app_privacy()
+        publish = self.privacy_publish_checkbox.isChecked()
+        for button in (self.btn_upload_privacy, self.start_btn, self.btn_preview_privacy):
+            button.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.time_label.setText("App Privacy: 0%")
+        self.privacy_worker = AppPrivacyWorker(api_creds, usages_config, publish=publish)
+        self.privacy_worker.log_msg.connect(self._log)
+        self.privacy_worker.progress_update.connect(self._update_progress)
+        def _privacy_finished():
+            for button in (self.btn_upload_privacy, self.start_btn, self.btn_preview_privacy):
+                button.setEnabled(True)
+        self.privacy_worker.finished.connect(_privacy_finished)
+        self.privacy_worker.start()
 
     def _line_text(self, widget):
         if isinstance(widget, QComboBox):
@@ -2143,8 +2282,11 @@ class MainWindow(QWidget):
             self.start_btn.setText("🚀 ЗАГРУЗИТЬ МЕТАДАННЫЕ ПРИЛОЖЕНИЯ")
         elif index == 3:
             self.start_btn.setText("⬆️ ЗАГРУЗКА СКРИНОВ: используйте кнопку в табе")
+        elif index == 4:
+            self.start_btn.setText("🔐 ЗАГРУЗИТЬ APP PRIVACY")
+            self._preview_app_privacy()
         else:
-            self.start_btn.setText("🔐 PREVIEW APP PRIVACY")
+            self.start_btn.setText("🚀 ЗАПУСТИТЬ ПРОЦЕСС")
 
     def _autofill_key_id_from_p8_path(self):
         filename = os.path.basename(self.p8_path_input.text().strip())
@@ -2472,8 +2614,8 @@ class MainWindow(QWidget):
             self.worker.finished.connect(lambda: self.start_btn.setEnabled(True))
             self.worker.start()
             return
-        else:
-            self._preview_app_privacy()
+        elif current_tab_index == 4:
+            self._upload_app_privacy()
             return
 
         self.start_btn.setEnabled(False)
