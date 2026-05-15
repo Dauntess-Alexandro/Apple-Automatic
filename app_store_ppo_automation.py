@@ -532,7 +532,7 @@ class MetadataWorker(QThread):
     }
     APP_INFO_LOCALIZATION_FIELDS = {
         "name", "subtitle", "privacyPolicyUrl", "privacyChoicesUrl",
-        "privacyPolicyText"
+        "privacyPolicyText", "copyright"
     }
     APP_REVIEW_DETAIL_FIELDS = {
         "contactFirstName", "contactLastName", "contactPhone", "contactEmail",
@@ -549,6 +549,14 @@ class MetadataWorker(QThread):
         for alias in ("notes", "releaseNotes", "whats_new"):
             if alias in normalized and "whatsNew" not in normalized:
                 normalized["whatsNew"] = normalized[alias]
+        if "kidsAgeBand" in normalized:
+            raw_age = str(normalized.get("kidsAgeBand", "")).strip()
+            allowed_age_bands = {"", "FIVE_AND_UNDER", "SIX_TO_EIGHT", "NINE_TO_ELEVEN"}
+            if raw_age and raw_age not in allowed_age_bands:
+                self.log_msg.emit(
+                    f"⚠️ Некорректный kidsAgeBand '{raw_age}'. Допустимо: FIVE_AND_UNDER / SIX_TO_EIGHT / NINE_TO_ELEVEN. Поле будет пропущено."
+                )
+                normalized.pop("kidsAgeBand", None)
         return {key: value for key, value in normalized.items() if key in allowed_fields and value not in (None, "")}
 
     def run(self):
@@ -1272,6 +1280,8 @@ class MainWindow(QWidget):
         self.meta_name_input.setPlaceholderText("App name")
         self.meta_subtitle_input = QLineEdit()
         self.meta_subtitle_input.setPlaceholderText("Subtitle")
+        self.meta_copyright_input = QLineEdit()
+        self.meta_copyright_input.setPlaceholderText("© Your Developer Name")
         self.meta_privacy_policy_url_input = QLineEdit()
         self.meta_privacy_policy_url_input.setPlaceholderText("https://example.com/privacy")
         self.meta_privacy_choices_url_input = QLineEdit()
@@ -1286,6 +1296,7 @@ class MainWindow(QWidget):
         self.meta_kids_age_band_input.setPlaceholderText("По умолчанию 4+ / без ограничений")
         app_info_form.addRow("Name:", self.meta_name_input)
         app_info_form.addRow("Subtitle:", self.meta_subtitle_input)
+        app_info_form.addRow("Copyright:", self.meta_copyright_input)
         app_info_form.addRow("Privacy Policy URL:", self.meta_privacy_policy_url_input)
         app_info_form.addRow("Privacy Choices URL:", self.meta_privacy_choices_url_input)
         app_info_form.addRow("Primary Category:", self.meta_primary_category_input)
@@ -1322,8 +1333,9 @@ class MainWindow(QWidget):
         self.gemini_key_input.setEchoMode(QLineEdit.Password)
         self.gemini_model_input = QLineEdit(os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
         self.gemini_model_input.setPlaceholderText("gemini-2.5-flash")
-        self.ai_developer_name_input = QLineEdit(os.getenv("DEVELOPER_NAME", ""))
+        self.ai_developer_name_input = QLineEdit("")
         self.ai_developer_name_input.setPlaceholderText("Developer name для App Review notes")
+        self.ai_developer_name_input.textChanged.connect(self._apply_developer_name_to_review_fields)
         self.ai_app_context_input = QTextEdit()
         self.ai_app_context_input.setFixedHeight(110)
         self.ai_app_context_input.setPlaceholderText("Вставьте ТЗ: смысл приложения, функционал, аудитория, ограничения, что точно есть/нет...")
@@ -1462,6 +1474,8 @@ class MainWindow(QWidget):
         self.btn_c.clicked.connect(lambda: self._select_folder("Variant C", self.btn_c))
         layout.addWidget(self.btn_c)
 
+        self.screenshot_controls = [self.lbl_folders, self.btn_a, self.btn_b, self.btn_c]
+
         progress_layout = QHBoxLayout()
         progress_layout.setContentsMargins(0, 10, 0, 0)
         self.progress_bar = QProgressBar()
@@ -1486,6 +1500,7 @@ class MainWindow(QWidget):
         layout.addWidget(self.start_btn)
 
         self.tabs.currentChanged.connect(self._on_tab_change)
+        self._on_tab_change(self.tabs.currentIndex())
 
     def _apply_styles(self):
         self.setStyleSheet("""
@@ -1631,6 +1646,19 @@ class MainWindow(QWidget):
             return str(value).strip() if value is not None else widget.currentText().strip()
         return widget.text().strip()
 
+    def _apply_developer_name_to_review_fields(self):
+        developer_name = self._line_text(self.ai_developer_name_input)
+        if not developer_name:
+            return
+        normalized_name = " ".join(developer_name.split())
+        name_parts = normalized_name.split(" ")
+        first_name = name_parts[0] if name_parts else ""
+        last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+        self.meta_review_first_name_input.setText(first_name)
+        self.meta_review_last_name_input.setText(last_name)
+        if not self._line_text(self.meta_copyright_input):
+            self.meta_copyright_input.setText(f"© {normalized_name}")
+
     def _text_edit_text(self, widget):
         return widget.toPlainText().strip()
 
@@ -1734,6 +1762,7 @@ class MainWindow(QWidget):
 
         self.meta_name_input.setText(app_info_item.get("name", ""))
         self.meta_subtitle_input.setText(app_info_item.get("subtitle", ""))
+        self.meta_copyright_input.setText(app_info_item.get("copyright", ""))
         self.meta_privacy_policy_url_input.setText(app_info_item.get("privacyPolicyUrl", ""))
         self.meta_privacy_choices_url_input.setText(app_info_item.get("privacyChoicesUrl", ""))
         self._set_combo_data(self.meta_primary_category_input, app_info.get("primaryCategory", ""))
@@ -1770,6 +1799,7 @@ class MainWindow(QWidget):
                     "locale": "en-US",
                     "name": "App Name",
                     "subtitle": "Short subtitle",
+                    "copyright": "© Your Developer Name",
                     "privacyPolicyUrl": "https://example.com/privacy",
                     "privacyChoicesUrl": "https://example.com/privacy-choices"
                 }
@@ -1809,6 +1839,7 @@ class MainWindow(QWidget):
             "locale": locale,
             "name": self._line_text(self.meta_name_input),
             "subtitle": self._line_text(self.meta_subtitle_input),
+            "copyright": self._line_text(self.meta_copyright_input),
             "privacyPolicyUrl": self._line_text(self.meta_privacy_policy_url_input),
             "privacyChoicesUrl": self._line_text(self.meta_privacy_choices_url_input)
         }
@@ -1819,6 +1850,12 @@ class MainWindow(QWidget):
             "secondaryCategory": self._line_text(self.meta_secondary_category_input),
             "kidsAgeBand": self._line_text(self.meta_kids_age_band_input)
         }
+        valid_category_ids = {cat_id for cat_id, _ in APP_CATEGORY_OPTIONS if cat_id}
+        for field in ("primaryCategory", "secondaryCategory"):
+            cat_id = app_info.get(field)
+            if cat_id and cat_id not in valid_category_ids:
+                self._log(f"⚠️ {field} '{cat_id}' не найден в списке App Store категорий. Поле будет пропущено.")
+                app_info[field] = ""
         app_info = {k: v for k, v in app_info.items() if v}
 
         app_review_detail = {
@@ -1945,7 +1982,12 @@ class MainWindow(QWidget):
         for cb in self.locale_checkboxes:
             cb.setChecked(state)
 
+    def _set_screenshot_controls_visible(self, visible):
+        for control in self.screenshot_controls:
+            control.setVisible(visible)
+
     def _on_tab_change(self, index):
+        self._set_screenshot_controls_visible(index in (0, 1))
         if index == 0:
             self.start_btn.setText("🚀 СОЗДАТЬ НОВЫЙ ТЕСТ")
         elif index == 1:
@@ -1999,8 +2041,6 @@ class MainWindow(QWidget):
             env_content += f"GEMINI_API_KEY={self.gemini_key_input.text().strip()}\n"
         if hasattr(self, "gemini_model_input"):
             env_content += f"GEMINI_MODEL={self.gemini_model_input.text().strip()}\n"
-        if hasattr(self, "ai_developer_name_input"):
-            env_content += f"DEVELOPER_NAME={self.ai_developer_name_input.text().strip()}\n"
         try:
             with open(".env", "w", encoding="utf-8") as f: f.write(env_content)
         except Exception as e:
