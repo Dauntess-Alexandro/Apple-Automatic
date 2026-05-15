@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import tempfile
 import jwt
 import requests
 import threading
@@ -16,7 +17,38 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QIcon
 from PySide6.QtCore import QThread, Signal, Qt, QSize
 
-load_dotenv()
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(SCRIPT_DIR, ".env")
+load_dotenv(ENV_PATH)
+
+# TinyPNG: встроенный ключ (если пусто — берётся из TINYPNG_API_KEY в .env)
+_BUILTIN_TINYPNG_API_KEY = ""
+
+
+def _read_env_file():
+    values = {}
+    if not os.path.isfile(ENV_PATH):
+        return values
+    try:
+        with open(ENV_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                values[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return values
+
+
+def resolve_tinypng_api_key():
+    env_file = _read_env_file()
+    return (
+        env_file.get("TINYPNG_API_KEY", "").strip()
+        or os.getenv("TINYPNG_API_KEY", "").strip()
+        or _BUILTIN_TINYPNG_API_KEY.strip()
+    )
 
 # Словарь: Код -> (Код_Флага, Понятное название)
 DEFAULT_GEMINI_PROMPT = """Описание:
@@ -165,6 +197,77 @@ def ensure_flags_downloaded():
             
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             executor.map(fetch, unique_ccs)
+
+class TinyPngCompressor:
+    """Сжатие PNG/JPEG через TinyPNG API перед загрузкой в App Store Connect."""
+
+    def __init__(self, api_key, logger_callback=None):
+        self.api_key = (api_key or "").strip()
+        self.enabled = bool(self.api_key)
+        self.logger = logger_callback or (lambda _msg: None)
+        self._cache = {}
+        self._temp_files = []
+        self._lock = threading.Lock()
+
+    def compress(self, file_path):
+        if not self.enabled:
+            return file_path
+        with self._lock:
+            if file_path in self._cache:
+                return self._cache[file_path]
+
+        original_size = os.path.getsize(file_path)
+        try:
+            with open(file_path, "rb") as source:
+                response = requests.post(
+                    "https://api.tinify.com/shrink",
+                    auth=(self.api_key, ""),
+                    data=source.read(),
+                    timeout=120,
+                )
+            response.raise_for_status()
+            output_url = response.json()["output"]["url"]
+            compressed = requests.get(output_url, timeout=120)
+            compressed.raise_for_status()
+
+            suffix = os.path.splitext(file_path)[1] or ".jpeg"
+            fd, temp_path = tempfile.mkstemp(suffix=suffix, prefix="tinypng_")
+            os.close(fd)
+            with open(temp_path, "wb") as out:
+                out.write(compressed.content)
+
+            new_size = os.path.getsize(temp_path)
+            with self._lock:
+                if file_path in self._cache:
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                    return self._cache[file_path]
+                self._temp_files.append(temp_path)
+                self._cache[file_path] = temp_path
+            self.logger(
+                f"TinyPNG: {os.path.basename(file_path)} "
+                f"{original_size // 1024} KB → {new_size // 1024} KB"
+            )
+            return temp_path
+        except Exception as exc:
+            self.logger(f"⚠️ TinyPNG ({os.path.basename(file_path)}): {exc}. Загружаем оригинал.")
+            with self._lock:
+                self._cache[file_path] = file_path
+            return file_path
+
+    def cleanup(self):
+        with self._lock:
+            temp_paths = list(self._temp_files)
+            self._temp_files.clear()
+            self._cache.clear()
+        for temp_path in temp_paths:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
 
 class ASCClient:
     def __init__(self, issuer_id, key_id, private_key_path, app_id, logger_callback):
@@ -596,6 +699,7 @@ class MetadataWorker(QThread):
     log_msg = Signal(str)
     progress_update = Signal(int, str)
     finished = Signal()
+    finished_ok = Signal(bool)
 
     VERSION_LOCALIZATION_FIELDS = {
         "description", "keywords", "marketingUrl", "promotionalText",
@@ -614,6 +718,7 @@ class MetadataWorker(QThread):
         super().__init__()
         self.api_creds = api_creds
         self.metadata_config = metadata_config
+        self.success = False
 
     def _clean_attributes(self, source, allowed_fields):
         normalized = dict(source)
@@ -752,10 +857,12 @@ class MetadataWorker(QThread):
 
             self.progress_update.emit(100, "Метаданные загружены")
             self.log_msg.emit("=== ПЕРВИЧНАЯ ЗАГРУЗКА МЕТАДАННЫХ ЗАВЕРШЕНА! ===")
+            self.success = True
         except Exception as e:
             self.progress_update.emit(0, "Ошибка метаданных")
             self.log_msg.emit(f"КРИТИЧЕСКАЯ ОШИБКА МЕТАДАННЫХ: {str(e)}")
         finally:
+            self.finished_ok.emit(self.success)
             self.finished.emit()
 
 
@@ -1003,7 +1110,7 @@ class AutomationWorker(QThread):
     progress_update = Signal(int, str)
     finished = Signal()
 
-    def __init__(self, mode, api_creds, test_name, traffic, target_variants, target_locales, variants_paths):
+    def __init__(self, mode, api_creds, test_name, traffic, target_variants, target_locales, variants_paths, tinypng_api_key=""):
         super().__init__()
         self.mode = mode 
         self.api_creds = api_creds
@@ -1012,6 +1119,7 @@ class AutomationWorker(QThread):
         self.target_variants = target_variants
         self.target_locales = target_locales 
         self.variants_paths = variants_paths
+        self.tinypng_api_key = tinypng_api_key
 
     def run(self):
         try:
@@ -1123,6 +1231,9 @@ class AutomationWorker(QThread):
             completed_tasks = 0
             start_time = time.time()
             progress_lock = threading.Lock() # Блокировка для безопасного обновления прогресса
+            tinypng = TinyPngCompressor(self.tinypng_api_key, self.log_msg.emit)
+            if tinypng.enabled:
+                self.log_msg.emit("TinyPNG: сжатие скринов перед загрузкой в App Store Connect...")
 
             def tick():
                 nonlocal completed_tasks
@@ -1157,21 +1268,25 @@ class AutomationWorker(QThread):
                     filepath = os.path.join(task['folder'], filename)
                     ext = os.path.splitext(filename)[1].lower() 
                     new_filename = f"{index}{ext}"
-                    client.upload_screenshot(target_set_id, filepath, new_filename)
+                    upload_path = tinypng.compress(filepath)
+                    client.upload_screenshot(target_set_id, upload_path, new_filename)
                     tick() # Тик после загрузки файла
 
             self.log_msg.emit(f"Начинаем многопоточную загрузку ({len(upload_tasks)} локалей)...")
             
             # Запускаем пул потоков (5 параллельных загрузок)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                futures = [executor.submit(upload_worker, t) for t in upload_tasks]
-                
-                # Ожидаем завершения всех потоков и отлавливаем ошибки
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        raise Exception(f"Сбой в одном из потоков: {str(e)}")
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                    futures = [executor.submit(upload_worker, t) for t in upload_tasks]
+                    
+                    # Ожидаем завершения всех потоков и отлавливаем ошибки
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            future.result()
+                        except Exception as e:
+                            raise Exception(f"Сбой в одном из потоков: {str(e)}")
+            finally:
+                tinypng.cleanup()
 
             self.progress_update.emit(100, "Завершено!")
             self.log_msg.emit("=== ПРОЦЕСС УСПЕШНО ЗАВЕРШЕН! ===")
@@ -1212,14 +1327,23 @@ class ScreenshotUploadWorker(QThread):
     progress_update = Signal(int, str)
     finished = Signal()
 
-    def __init__(self, api_creds, target_locales, jpeg_files):
+    def __init__(self, api_creds, target_locales, jpeg_files, tinypng_api_key=""):
         super().__init__()
         self.api_creds = api_creds
         self.target_locales = target_locales
         self.jpeg_files = jpeg_files
+        self.tinypng_api_key = tinypng_api_key
 
     def run(self):
+        tinypng = None
         try:
+            tinypng = TinyPngCompressor(self.tinypng_api_key, self.log_msg.emit)
+            if tinypng.enabled:
+                self.log_msg.emit("TinyPNG: сжатие скринов перед загрузкой...")
+                prepared_files = [tinypng.compress(path) for path in self.jpeg_files]
+            else:
+                prepared_files = self.jpeg_files
+
             client = ASCClient(
                 self.api_creds["issuer"], self.api_creds["key_id"],
                 self.api_creds["p8_path"], self.api_creds["app_id"], self.log_msg.emit
@@ -1255,9 +1379,9 @@ class ScreenshotUploadWorker(QThread):
                 else:
                     target_set_id = target_set["id"]
 
-                for idx, file_path in enumerate(self.jpeg_files, start=1):
-                    file_name = f"{idx}_{os.path.basename(file_path)}"
-                    self.log_msg.emit(f"[{locale}] Upload {idx}/{len(self.jpeg_files)}: {file_name}")
+                for idx, file_path in enumerate(prepared_files, start=1):
+                    file_name = f"{idx}_{os.path.basename(self.jpeg_files[idx - 1])}"
+                    self.log_msg.emit(f"[{locale}] Upload {idx}/{len(prepared_files)}: {file_name}")
                     client.upload_screenshot(target_set_id, file_path, file_name)
                     done += 1
                     percent = int((done / total_steps) * 100)
@@ -1268,6 +1392,8 @@ class ScreenshotUploadWorker(QThread):
         except Exception as e:
             self.log_msg.emit(f"Ошибка Upload: {str(e)}")
         finally:
+            if tinypng:
+                tinypng.cleanup()
             self.finished.emit()
 
 
@@ -1281,6 +1407,7 @@ class MainWindow(QWidget):
         self.variants_paths = {"Variant A": "", "Variant B": "", "Variant C": ""}
         self._setup_ui()
         self._apply_styles()
+        self._ensure_tinypng_key_visible()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -1309,6 +1436,12 @@ class MainWindow(QWidget):
         key_layout.addWidget(self.p8_path_input)
         key_layout.addWidget(self.btn_select_p8)
         layout.addLayout(key_layout)
+
+        self.tinypng_key_input = QLineEdit(resolve_tinypng_api_key())
+        self.tinypng_key_input.setPlaceholderText("TinyPNG API key (сохраняется в .env)")
+        self.tinypng_key_input.editingFinished.connect(self._save_env_to_file)
+        layout.addWidget(QLabel("TinyPNG API key (сжатие скринов, всегда включено):"))
+        layout.addWidget(self.tinypng_key_input)
 
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
@@ -1603,12 +1736,21 @@ class MainWindow(QWidget):
         custom_layout.addWidget(self.metadata_text)
         metadata_form_layout.addWidget(custom_group)
 
+        self.chain_screenshots_checkbox = QCheckBox(
+            "После метаданных: TinyPNG → загрузка скринов (файлы и локали — вкладка «ЗАГРУЗКА СКРИНОВ»)"
+        )
+        metadata_form_layout.addWidget(self.chain_screenshots_checkbox)
+
         metadata_scroll.setWidget(metadata_widget)
         metadata_layout.addWidget(metadata_scroll)
         self.tabs.addTab(self.tab_metadata, "🧾 ПЕРВИЧНАЯ ЗАГРУЗКА")
         self.tab_screens_upload = QWidget()
         screens_upload_layout = QVBoxLayout(self.tab_screens_upload)
         screens_upload_layout.addWidget(QLabel("Загрузка скринов (.jpeg) в App Store Connect на target 6.9 inch."))
+        screens_upload_layout.addWidget(QLabel(
+            "Порядок: «ПЕРВИЧНАЯ ЗАГРУЗКА» (метаданные) → TinyPNG → upload сюда. "
+            "Или включите авто-цепочку на вкладке метаданных."
+        ))
         self.btn_refresh_locales = QPushButton("🔄 Обновить локали")
         self.btn_refresh_locales.clicked.connect(self._refresh_screenshot_locales)
         screens_upload_layout.addWidget(self.btn_refresh_locales)
@@ -1893,8 +2035,6 @@ class MainWindow(QWidget):
         config = self._app_privacy_config()
         text = json.dumps(config, ensure_ascii=False, indent=2)
         self.privacy_preview_text.setPlainText(text)
-        self._log("App Privacy JSON (формат fastlane / App Store Connect API):")
-        self._log(text)
 
     def _upload_app_privacy(self):
         self._save_env_to_file()
@@ -2322,18 +2462,20 @@ class MainWindow(QWidget):
         self.time_label.setText(time_text)
 
     def _save_env_to_file(self):
+        tinypng_key = self._tinypng_api_key()
         env_content = (
             f"ISSUER_ID={self.issuer_input.text().strip()}\n"
             f"KEY_ID={self.key_input.text().strip()}\n"
             f"APP_ID={self.app_input.text().strip()}\n"
             f"PRIVATE_KEY_PATH={self.p8_path_input.text().strip()}\n"
+            f"TINYPNG_API_KEY={tinypng_key}\n"
         )
         if hasattr(self, "gemini_key_input"):
             env_content += f"GEMINI_API_KEY={self.gemini_key_input.text().strip()}\n"
         if hasattr(self, "gemini_model_input"):
             env_content += f"GEMINI_MODEL={self.gemini_model_input.text().strip()}\n"
         try:
-            with open(".env", "w", encoding="utf-8") as f: f.write(env_content)
+            with open(ENV_PATH, "w", encoding="utf-8") as f: f.write(env_content)
         except Exception as e:
             self._log(f"Ошибка сохранения .env файла: {e}")
 
@@ -2511,6 +2653,41 @@ class MainWindow(QWidget):
         for cb in self.upload_locale_checkboxes:
             cb.setChecked(cb.property("locale_code") in active)
 
+    def _ensure_tinypng_key_visible(self):
+        key = resolve_tinypng_api_key()
+        if key and hasattr(self, "tinypng_key_input"):
+            self.tinypng_key_input.setText(key)
+
+    def _tinypng_api_key(self):
+        if hasattr(self, "tinypng_key_input"):
+            typed = self.tinypng_key_input.text().strip()
+            if typed:
+                return typed
+        return resolve_tinypng_api_key()
+
+    def _validate_screenshot_upload_prereqs(self):
+        target_locales = [cb.property("locale_code") for cb in self.upload_locale_checkboxes if cb.isChecked()]
+        if not target_locales:
+            self._log("Ошибка: Выберите хотя бы одну локаль на вкладке «ЗАГРУЗКА СКРИНОВ».")
+            return False
+        if not self.upload_jpeg_files:
+            self._log("Ошибка: Выберите .jpeg файлы на вкладке «ЗАГРУЗКА СКРИНОВ».")
+            return False
+        if not self._tinypng_api_key():
+            self._log("Ошибка: Укажите TinyPNG API key в настройках API.")
+            return False
+        return True
+
+    def _on_metadata_upload_finished(self, success):
+        self.start_btn.setEnabled(True)
+        if not success or not self.chain_screenshots_checkbox.isChecked():
+            return
+        if not self._validate_screenshot_upload_prereqs():
+            self._log("Авто-загрузка скринов пропущена: проверьте вкладку «ЗАГРУЗКА СКРИНОВ».")
+            return
+        self._log("Метаданные загружены. Запуск TinyPNG → upload скринов...")
+        self._start_screenshot_upload()
+
     def _select_jpeg_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Выберите .jpeg файлы", "", "JPEG Files (*.jpeg *.jpg)")
         if files:
@@ -2532,13 +2709,14 @@ class MainWindow(QWidget):
         if not target_locales:
             self._log("Ошибка: Выберите хотя бы одну локаль для загрузки скринов.")
             return
-        if not self.upload_jpeg_files:
-            self._log("Ошибка: Выберите хотя бы один .jpeg файл.")
+        if not self._validate_screenshot_upload_prereqs():
             return
         self.btn_execute_upload.setEnabled(False)
         self.progress_bar.setValue(0)
         self.time_label.setText("Загрузка: 0%")
-        self.screenshot_upload_worker = ScreenshotUploadWorker(api_creds, target_locales, self.upload_jpeg_files)
+        self.screenshot_upload_worker = ScreenshotUploadWorker(
+            api_creds, target_locales, self.upload_jpeg_files, self._tinypng_api_key()
+        )
         self.screenshot_upload_worker.log_msg.connect(self._log)
         self.screenshot_upload_worker.progress_update.connect(self._update_progress)
         self.screenshot_upload_worker.finished.connect(lambda: self.btn_execute_upload.setEnabled(True))
@@ -2602,6 +2780,8 @@ class MainWindow(QWidget):
             if not metadata_config:
                 self._log("Ошибка: Заполните хотя бы одно поле метаданных.")
                 return
+            if self.chain_screenshots_checkbox.isChecked() and not self._validate_screenshot_upload_prereqs():
+                return
 
             self.start_btn.setEnabled(False)
             self.progress_bar.setValue(0)
@@ -2611,11 +2791,16 @@ class MainWindow(QWidget):
             self.worker = MetadataWorker(api_creds, metadata_config)
             self.worker.log_msg.connect(self._log)
             self.worker.progress_update.connect(self._update_progress)
-            self.worker.finished.connect(lambda: self.start_btn.setEnabled(True))
+            self.worker.finished_ok.connect(self._on_metadata_upload_finished)
             self.worker.start()
             return
         elif current_tab_index == 4:
             self._upload_app_privacy()
+            return
+
+        tinypng_api_key = self._tinypng_api_key()
+        if not tinypng_api_key:
+            self._log("Ошибка: Укажите TinyPNG API key в настройках API.")
             return
 
         self.start_btn.setEnabled(False)
@@ -2623,7 +2808,10 @@ class MainWindow(QWidget):
         self.time_label.setText("Осталось: --:--")
         self.log_area.clear()
         
-        self.worker = AutomationWorker(mode, api_creds, test_name, traffic, target_variants, target_locales, self.variants_paths)
+        self.worker = AutomationWorker(
+            mode, api_creds, test_name, traffic, target_variants, target_locales,
+            self.variants_paths, tinypng_api_key
+        )
         self.worker.log_msg.connect(self._log)
         self.worker.progress_update.connect(self._update_progress)
         self.worker.finished.connect(lambda: self.start_btn.setEnabled(True))
