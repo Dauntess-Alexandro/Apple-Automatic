@@ -13,14 +13,51 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QLineEdit, QPushButton, QTextEdit, QFileDialog, QLabel, QGroupBox,
     QProgressBar, QTabWidget, QCheckBox, QScrollArea, QComboBox, QToolButton,
-    QDialog, QListWidget, QListWidgetItem, QMessageBox
+    QFrame, QSplitter, QSizePolicy,
+    QDialog, QListWidget, QListWidgetItem, QMessageBox, QTableWidget, QTableWidgetItem
 )
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QFont, QGuiApplication, QColor
 from PySide6.QtCore import QThread, Signal, Qt, QSize
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(SCRIPT_DIR, ".env")
 load_dotenv(ENV_PATH)
+
+# UI scale tuned for 1080p–2K displays
+UI_FONT_BASE_PT = 14
+UI_FONT_TITLE_PT = 20
+UI_FONT_SECTION_PT = 12
+UI_LOCALE_GRID_COLUMNS = 5
+UI_FORM_MAX_WIDTH = 980
+UI_LOG_MIN_HEIGHT = 320
+UI_LOCALE_COLUMN_MIN_WIDTH = 170
+
+
+def default_window_size():
+    screen = QGuiApplication.primaryScreen()
+    if screen is None:
+        return 1560, 980
+    avail = screen.availableGeometry()
+    width = min(max(int(avail.width() * 0.82), 1400), 2100)
+    height = min(max(int(avail.height() * 0.88), 860), 1320)
+    return width, height
+
+
+def make_page_header(title, subtitle=None):
+    container = QWidget()
+    container.setObjectName("page_header")
+    layout = QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 10)
+    layout.setSpacing(4)
+    title_label = QLabel(title)
+    title_label.setProperty("role", "title")
+    layout.addWidget(title_label)
+    if subtitle:
+        hint = QLabel(subtitle)
+        hint.setProperty("role", "hint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+    return container
 
 # TinyPNG: встроенный ключ (если пусто — берётся из TINYPNG_API_KEY в .env)
 _BUILTIN_TINYPNG_API_KEY = ""
@@ -202,6 +239,61 @@ DEFAULT_PROMPT_PROFILES = {
     "Strict keywords only": """Act as a Senior ASO specialist. Generate only keywords under 100 characters including commas. Use lowercase, no spaces after commas, no duplicates, no dashes, no generic filler words, and exclude words from the app name and subtitle. Return JSON only.""",
     "Review notes clean": """Create concise App Review notes in English. Professional, calm, human. Mention only facts explicitly provided in the brief. Avoid privacy/legal overexplaining and avoid template language. Return JSON only.""",
     "Category safety": """Recommend primary and secondary App Store categories based only on explicitly stated features. Be conservative and moderation-safe. Explain category mismatch risks in categoryName. Return JSON only.""",
+}
+
+TRANSLATION_FIELDS = [
+    ("description", "Description", 4000, "version"),
+    ("keywords", "Keywords", 100, "version"),
+    ("promotionalText", "Promotional Text", 170, "version"),
+    ("whatsNew", "What's New", 4000, "version"),
+    ("subtitle", "Subtitle", 30, "app_info"),
+]
+
+TRANSLATION_PROFILES = {
+    "ASO natural": (
+        "Translate as a senior App Store localization editor. Preserve the original meaning, features, "
+        "constraints, and factual claims exactly. Adapt wording naturally for the target locale so it reads "
+        "like native App Store copy, not a literal machine translation. Keep a polished ASO tone, but do not "
+        "invent new features, benefits, pricing, privacy claims, subscriptions, tracking, login, ads, or medical/"
+        "financial claims unless they are explicitly present in the source. For description and promotional text, "
+        "keep the copy fluent and human. For subtitle, keep it concise and within the Apple limit. For keywords, "
+        "keep comma-separated keyword intent and localize terms users would actually search for."
+    ),
+    "Strict literal": (
+        "Translate as close to the source as possible while making the target language grammatically correct. "
+        "Preserve sentence order, structure, tone, and terminology. Do not rewrite creatively, do not optimize, "
+        "do not add marketing embellishments, and do not remove factual details unless required by grammar. "
+        "Use this profile when legal/product accuracy matters more than ASO style."
+    ),
+    "Keywords optimized": (
+        "Optimize specifically for App Store keyword localization. Keep the result lowercase where the language "
+        "allows it, comma-separated, with no spaces after commas unless the locale normally requires them. Stay "
+        "under Apple's keyword limit. Remove duplicates, generic filler words, weak words like best/top/free/easy/"
+        "simple/app, and words already contained in the app name or subtitle if obvious from the source. Localize "
+        "search intent, not just words: use natural local market terms, common synonyms, and high-intent phrases. "
+        "Return only the final keyword string for keyword fields. For non-keyword fields, still translate naturally "
+        "but keep the language concise and ASO-aware."
+    ),
+    "Short premium style": (
+        "Translate and compress into a premium, concise App Store style. Prefer short clean sentences, polished "
+        "phrasing, and confident wording. Preserve all important meaning but remove fluff, repetition, and weak "
+        "generic marketing language. This is best for subtitle, promotional text, and short release notes. Do not "
+        "sound exaggerated, salesy, or AI-generated. Never invent claims not present in the source."
+    ),
+    "No banned words": (
+        "Translate naturally while actively avoiding banned or overused marketing clichés such as revolutionary, "
+        "seamless, unlock, empower, unleash, ultimate, simple, solution, discover, master, stay organized, and "
+        "similar hype words in the target language. Keep the wording compliant, factual, calm, and App Store-safe. "
+        "Do not add unsupported privacy, tracking, login, ads, subscription, medical, or financial claims. If the "
+        "source contains a risky phrase, translate the meaning using safer wording instead of copying the risk."
+    ),
+}
+
+TRANSLATION_STATUS_COLORS = {
+    "error": QColor("#7F1D1D"),
+    "warn": QColor("#713F12"),
+    "info": QColor("#1E3A8A"),
+    "ok": QColor("#14532D"),
 }
 
 APP_CATEGORY_OPTIONS = [
@@ -498,6 +590,32 @@ class ASCClient:
             raise Exception("Не найдена подходящая версия приложения для работы.")
         return data["data"][0]["id"]
 
+    def get_latest_app_store_version_info(self):
+        version_id = self.get_latest_app_store_version()
+        attrs = self.get_app_store_version_attributes(version_id)
+        return {
+            "id": version_id,
+            "version_string": attrs.get("versionString", ""),
+            "state": attrs.get("appStoreState", ""),
+            "platform": attrs.get("platform", ""),
+        }
+
+    def list_apps(self):
+        self.logger("Получение списка приложений App Store Connect...")
+        endpoint = "apps?limit=200&fields[apps]=name,bundleId,sku,primaryLocale"
+        data = self._request("GET", endpoint)
+        apps = []
+        for item in data.get("data", []):
+            attrs = item.get("attributes", {})
+            apps.append({
+                "id": item.get("id", ""),
+                "name": attrs.get("name", ""),
+                "bundle_id": attrs.get("bundleId", ""),
+                "sku": attrs.get("sku", ""),
+                "primary_locale": attrs.get("primaryLocale", ""),
+            })
+        return apps
+
     def get_app_store_version_attributes(self, version_id):
         data = self._request("GET", f"appStoreVersions/{version_id}")
         return data.get("data", {}).get("attributes", {}) if data else {}
@@ -514,6 +632,14 @@ class ASCClient:
         endpoint = f"appStoreVersions/{version_id}/appStoreVersionLocalizations?limit=200"
         data = self._request("GET", endpoint)
         return data.get("data", []) if data else []
+
+    def get_version_localization_by_locale(self, version_id, locale):
+        records = self.get_version_localization_records(version_id)
+        for item in records:
+            attrs = item.get("attributes", {})
+            if attrs.get("locale") == locale:
+                return {"id": item.get("id", ""), "attributes": attrs}
+        return None
 
     def create_version_localization(self, version_id, locale, attributes):
         payload = {
@@ -601,6 +727,14 @@ class ASCClient:
         data = self._request("GET", endpoint)
         return data.get("data", []) if data else []
 
+    def get_app_info_localization_by_locale(self, app_info_id, locale):
+        records = self.get_app_info_localization_records(app_info_id)
+        for item in records:
+            attrs = item.get("attributes", {})
+            if attrs.get("locale") == locale:
+                return {"id": item.get("id", ""), "attributes": attrs}
+        return None
+
     def create_app_info_localization(self, app_info_id, locale, attributes):
         payload = {
             "data": {
@@ -622,6 +756,46 @@ class ASCClient:
             attributes,
             APP_INFO_LOCALIZATION_UNKNOWN,
         )
+
+    def ensure_version_localization(self, version_id, locale):
+        existing = self.get_version_localization_by_locale(version_id, locale)
+        if existing:
+            return existing["id"], False
+        created_id = self.create_version_localization(version_id, locale, {})
+        return created_id, True
+
+    def ensure_app_info_localization(self, app_info_id, locale):
+        existing = self.get_app_info_localization_by_locale(app_info_id, locale)
+        if existing:
+            return existing["id"], False
+        created_id = self.create_app_info_localization(app_info_id, locale, {})
+        return created_id, True
+
+    def get_translation_source_payload(self, source_locale):
+        version_id = self.get_latest_app_store_version()
+        app_info_id = self.get_app_info()
+        version_item = self.get_version_localization_by_locale(version_id, source_locale)
+        app_info_item = self.get_app_info_localization_by_locale(app_info_id, source_locale)
+
+        source = {"locale": source_locale}
+        if version_item:
+            attrs = version_item.get("attributes", {})
+            source.update({
+                "description": attrs.get("description", ""),
+                "keywords": attrs.get("keywords", ""),
+                "promotionalText": attrs.get("promotionalText", ""),
+                "whatsNew": attrs.get("whatsNew", ""),
+            })
+        if app_info_item:
+            attrs = app_info_item.get("attributes", {})
+            source.update({
+                "subtitle": attrs.get("subtitle", ""),
+            })
+        return {
+            "version_id": version_id,
+            "app_info_id": app_info_id,
+            "source": source,
+        }
 
     def update_app_info(self, app_info_id, attributes=None, relationships=None):
         payload = {
@@ -1240,6 +1414,63 @@ class FetchCurrentMetadataWorker(QThread):
             self.finished.emit()
 
 
+class FetchMetadataSourceWorker(QThread):
+    log_msg = Signal(str)
+    source_fetched = Signal(dict)
+    finished = Signal()
+
+    def __init__(self, api_creds):
+        super().__init__()
+        self.api_creds = api_creds
+
+    def run(self):
+        try:
+            self.log_msg.emit("Pull from Apple: определяю primary locale и latest version...")
+            client = ASCClient(
+                self.api_creds["issuer"],
+                self.api_creds["key_id"],
+                self.api_creds["p8_path"],
+                self.api_creds["app_id"],
+                self.log_msg.emit
+            )
+            primary_locale = client.get_app_primary_locale()
+            version_info = client.get_latest_app_store_version_info()
+            version_id = version_info.get("id")
+            version_records = client.get_version_localization_records(version_id)
+            version_item = next(
+                (item["attributes"] for item in version_records if item["attributes"].get("locale") == primary_locale),
+                None
+            )
+
+            app_info_id = client.get_app_info()
+            app_info_records = client.get_app_info_localization_records(app_info_id)
+            app_info_item = next(
+                (item["attributes"] for item in app_info_records if item["attributes"].get("locale") == primary_locale),
+                None
+            )
+
+            review_detail = client.get_app_review_detail(version_id)
+            metadata_config = {
+                "source_locale": primary_locale,
+                "version_info": version_info,
+            }
+            if version_item:
+                metadata_config["version_localizations"] = [version_item]
+            if app_info_item:
+                metadata_config["app_info_localizations"] = [app_info_item]
+            if review_detail:
+                metadata_config["app_review_detail"] = review_detail.get("attributes", {})
+            self.source_fetched.emit(metadata_config)
+            self.log_msg.emit(
+                f"✅ Pull from Apple готов: {primary_locale}, "
+                f"{version_info.get('version_string') or '—'} {version_info.get('state') or ''}"
+            )
+        except Exception as e:
+            self.log_msg.emit(f"Ошибка Pull from Apple: {str(e)}")
+        finally:
+            self.finished.emit()
+
+
 class FetchPrimaryLocaleWorker(QThread):
     log_msg = Signal(str)
     primary_locale_fetched = Signal(str)
@@ -1264,6 +1495,297 @@ class FetchPrimaryLocaleWorker(QThread):
             self.log_msg.emit(f"✅ Primary locale приложения: {primary_locale}")
         except Exception as e:
             self.log_msg.emit(f"Ошибка загрузки primary locale: {str(e)}")
+        finally:
+            self.finished.emit()
+
+
+class FetchAppVersionWorker(QThread):
+    log_msg = Signal(str)
+    version_fetched = Signal(dict)
+    finished = Signal()
+
+    def __init__(self, api_creds):
+        super().__init__()
+        self.api_creds = api_creds
+
+    def run(self):
+        try:
+            self.log_msg.emit("Получение версии приложения из App Store Connect...")
+            client = ASCClient(
+                self.api_creds["issuer"],
+                self.api_creds["key_id"],
+                self.api_creds["p8_path"],
+                self.api_creds["app_id"],
+                self.log_msg.emit
+            )
+            version_info = client.get_latest_app_store_version_info()
+            self.version_fetched.emit(version_info)
+            version = version_info.get("version_string") or "без versionString"
+            state = version_info.get("state") or "unknown state"
+            self.log_msg.emit(f"✅ Версия приложения: {version} ({state})")
+        except Exception as e:
+            self.log_msg.emit(f"Ошибка загрузки версии приложения: {str(e)}")
+        finally:
+            self.finished.emit()
+
+
+class FetchAppsWorker(QThread):
+    log_msg = Signal(str)
+    apps_fetched = Signal(list)
+    finished = Signal()
+
+    def __init__(self, api_creds):
+        super().__init__()
+        self.api_creds = api_creds
+
+    def run(self):
+        try:
+            client = ASCClient(
+                self.api_creds["issuer"],
+                self.api_creds["key_id"],
+                self.api_creds["p8_path"],
+                "",
+                self.log_msg.emit
+            )
+            apps = client.list_apps()
+            self.apps_fetched.emit(apps)
+            self.log_msg.emit(f"✅ Приложений найдено: {len(apps)}")
+        except Exception as e:
+            self.log_msg.emit(f"Ошибка загрузки списка приложений: {str(e)}")
+        finally:
+            self.finished.emit()
+
+
+class FetchTranslationSourceWorker(QThread):
+    log_msg = Signal(str)
+    source_fetched = Signal(dict)
+    finished = Signal()
+
+    def __init__(self, api_creds, source_locale):
+        super().__init__()
+        self.api_creds = api_creds
+        self.source_locale = source_locale
+
+    def run(self):
+        try:
+            self.log_msg.emit(f"Загрузка source metadata для {self.source_locale}...")
+            client = ASCClient(
+                self.api_creds["issuer"],
+                self.api_creds["key_id"],
+                self.api_creds["p8_path"],
+                self.api_creds["app_id"],
+                self.log_msg.emit
+            )
+            payload = client.get_translation_source_payload(self.source_locale)
+            self.source_fetched.emit(payload)
+            non_empty = sum(1 for field_key, _, _, _ in TRANSLATION_FIELDS if payload["source"].get(field_key))
+            self.log_msg.emit(f"✅ Source metadata загружен. Непустых полей: {non_empty}")
+        except Exception as e:
+            self.log_msg.emit(f"Ошибка source pull: {str(e)}")
+        finally:
+            self.finished.emit()
+
+
+class FetchTranslationAutoSourceWorker(QThread):
+    log_msg = Signal(str)
+    source_fetched = Signal(dict)
+    finished = Signal()
+
+    def __init__(self, api_creds):
+        super().__init__()
+        self.api_creds = api_creds
+
+    def run(self):
+        try:
+            self.log_msg.emit("Определяю primary locale и загружаю source metadata...")
+            client = ASCClient(
+                self.api_creds["issuer"],
+                self.api_creds["key_id"],
+                self.api_creds["p8_path"],
+                self.api_creds["app_id"],
+                self.log_msg.emit
+            )
+            primary_locale = client.get_app_primary_locale()
+            payload = client.get_translation_source_payload(primary_locale)
+            payload["primary_locale"] = primary_locale
+            self.source_fetched.emit(payload)
+            self.log_msg.emit(f"✅ Auto source готов для locale: {primary_locale}")
+        except Exception as e:
+            self.log_msg.emit(f"Ошибка auto source: {str(e)}")
+        finally:
+            self.finished.emit()
+
+
+class GeminiLocalizationTranslationWorker(QThread):
+    log_msg = Signal(str)
+    translations_ready = Signal(list)
+    finished = Signal()
+
+    def __init__(self, api_key, model, source_locale, target_locales, fields, profile_name, source_payload):
+        super().__init__()
+        self.api_key = api_key
+        self.model = model
+        self.source_locale = source_locale
+        self.target_locales = target_locales
+        self.fields = fields
+        self.profile_name = profile_name
+        self.source_payload = source_payload
+
+    def _translate_field(self, target_locale, field_name, source_text):
+        prompt_rule = TRANSLATION_PROFILES.get(self.profile_name, TRANSLATION_PROFILES["ASO natural"])
+        prompt = f"""
+Translate App Store metadata field.
+Source locale: {self.source_locale}
+Target locale: {target_locale}
+Field: {field_name}
+Profile: {self.profile_name}
+Rule: {prompt_rule}
+
+Return only translated text. No JSON. No markdown.
+Preserve commas for keywords where relevant.
+
+Source text:
+{source_text}
+""".strip()
+
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2},
+        }
+        response = requests.post(
+            endpoint,
+            headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
+            json=payload,
+            timeout=90,
+        )
+        response.raise_for_status()
+        data = response.json()
+        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        text = "".join(part.get("text", "") for part in parts).strip()
+        return text
+
+    def run(self):
+        rows = []
+        try:
+            total = max(1, len(self.target_locales) * len(self.fields))
+            done = 0
+            for locale in self.target_locales:
+                for field_name in self.fields:
+                    source_text = str(self.source_payload.get(field_name, "") or "").strip()
+                    if not source_text:
+                        rows.append({
+                            "locale": locale,
+                            "field": field_name,
+                            "source": "",
+                            "translation": "",
+                            "status": "warn",
+                            "warning": "Пустой source для поля",
+                        })
+                        done += 1
+                        continue
+                    try:
+                        translated = self._translate_field(locale, field_name, source_text)
+                        rows.append({
+                            "locale": locale,
+                            "field": field_name,
+                            "source": source_text,
+                            "translation": translated,
+                            "status": "ok" if translated else "warn",
+                            "warning": "" if translated else "Пустой перевод",
+                        })
+                    except Exception as field_exc:
+                        rows.append({
+                            "locale": locale,
+                            "field": field_name,
+                            "source": source_text,
+                            "translation": "",
+                            "status": "error",
+                            "warning": f"Ошибка Gemini: {field_exc}",
+                        })
+                    done += 1
+                    self.log_msg.emit(f"Перевод {done}/{total}: {locale} · {field_name}")
+            self.translations_ready.emit(rows)
+            self.log_msg.emit("✅ Перевод локализаций завершен.")
+        except Exception as e:
+            self.log_msg.emit(f"Ошибка перевода локализаций: {str(e)}")
+        finally:
+            self.finished.emit()
+
+
+class LocalizationUploadWorker(QThread):
+    log_msg = Signal(str)
+    progress_update = Signal(int, str)
+    upload_finished = Signal(dict)
+    finished = Signal()
+
+    def __init__(self, api_creds, rows):
+        super().__init__()
+        self.api_creds = api_creds
+        self.rows = rows
+
+    def run(self):
+        summary = {"locales": 0, "fields": 0, "errors": 0}
+        try:
+            client = ASCClient(
+                self.api_creds["issuer"],
+                self.api_creds["key_id"],
+                self.api_creds["p8_path"],
+                self.api_creds["app_id"],
+                self.log_msg.emit
+            )
+            version_id = client.get_latest_app_store_version()
+            app_info_id = client.get_app_info()
+            grouped = {}
+            for row in self.rows:
+                if row.get("status") != "ok":
+                    continue
+                locale = row.get("locale", "")
+                if not locale:
+                    continue
+                grouped.setdefault(locale, {"version": {}, "app_info": {}})
+                field = row.get("field")
+                value = row.get("translation", "")
+                field_meta = next((f for f in TRANSLATION_FIELDS if f[0] == field), None)
+                if not field_meta:
+                    continue
+                target_key = "version" if field_meta[3] == "version" else "app_info"
+                grouped[locale][target_key][field] = value
+
+            total_locales = max(1, len(grouped))
+            done_locales = 0
+            for locale, payloads in grouped.items():
+                try:
+                    if payloads["version"]:
+                        loc_id, created = client.ensure_version_localization(version_id, locale)
+                        attrs = sanitize_version_localization_attributes(payloads["version"], self.log_msg.emit)
+                        if attrs:
+                            client.update_version_localization(loc_id, attrs)
+                            self.log_msg.emit(
+                                f"✅ [{locale}] version localization {'создана' if created else 'обновлена'}."
+                            )
+                            summary["fields"] += len(attrs)
+                    if payloads["app_info"]:
+                        loc_id, created = client.ensure_app_info_localization(app_info_id, locale)
+                        attrs = sanitize_app_info_localization_attributes(payloads["app_info"], self.log_msg.emit)
+                        if attrs:
+                            client.update_app_info_localization(loc_id, attrs)
+                            self.log_msg.emit(
+                                f"✅ [{locale}] app info localization {'создана' if created else 'обновлена'}."
+                            )
+                            summary["fields"] += len(attrs)
+                    summary["locales"] += 1
+                except Exception as locale_exc:
+                    summary["errors"] += 1
+                    self.log_msg.emit(f"❌ [{locale}] Ошибка upload: {locale_exc}")
+                done_locales += 1
+                percent = int((done_locales / total_locales) * 100)
+                self.progress_update.emit(percent, f"Локализации: {done_locales}/{total_locales}")
+            self.upload_finished.emit(summary)
+        except Exception as e:
+            summary["errors"] += 1
+            self.log_msg.emit(f"Критическая ошибка upload локализаций: {e}")
+            self.upload_finished.emit(summary)
         finally:
             self.finished.emit()
 
@@ -1727,76 +2249,473 @@ class ScreenshotUploadWorker(QThread):
             self.finished.emit()
 
 
+class CollapsibleApiPanel(QGroupBox):
+    def __init__(self, title, parent=None):
+        super().__init__(title, parent)
+        self.setCheckable(True)
+        self.setChecked(True)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(12, 12, 12, 10)
+        root_layout.setSpacing(8)
+
+        self.summary_label = QLabel("")
+        self.summary_label.setProperty("role", "hint")
+        root_layout.addWidget(self.summary_label)
+
+        self.body_widget = QWidget()
+        self.body_layout = QVBoxLayout(self.body_widget)
+        self.body_layout.setContentsMargins(0, 0, 0, 0)
+        self.body_layout.setSpacing(8)
+        root_layout.addWidget(self.body_widget)
+        self.toggled.connect(self._on_toggled)
+        self._on_toggled(True)
+
+    def _on_toggled(self, expanded):
+        self.body_widget.setVisible(expanded)
+
+    def set_summary(self, text, status="neutral"):
+        self.summary_label.setText(text)
+        self.summary_label.setProperty("status", status)
+        self.summary_label.style().unpolish(self.summary_label)
+        self.summary_label.style().polish(self.summary_label)
+
+
+class VariantFolderCard(QFrame):
+    select_requested = Signal(str)
+
+    def __init__(self, variant_name, parent=None):
+        super().__init__(parent)
+        self.variant_name = variant_name
+        self.setObjectName("variant_card")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        title = QLabel(variant_name)
+        title.setProperty("role", "section")
+        layout.addWidget(title)
+
+        self.path_label = QLabel("Папка не выбрана")
+        self.path_label.setProperty("role", "hint")
+        self.path_label.setWordWrap(True)
+        layout.addWidget(self.path_label)
+
+        self.select_btn = QPushButton("Выбрать папку")
+        self.select_btn.setObjectName("utility_btn")
+        self.select_btn.clicked.connect(lambda: self.select_requested.emit(self.variant_name))
+        layout.addWidget(self.select_btn)
+
+    def set_path(self, folder_path):
+        if folder_path:
+            label = os.path.basename(folder_path)
+            try:
+                jpeg_count = sum(
+                    1 for name in os.listdir(folder_path)
+                    if name.lower().endswith((".jpeg", ".jpg"))
+                )
+                if jpeg_count:
+                    label = f"{label} · {jpeg_count} jpeg"
+            except OSError:
+                pass
+            self.path_label.setText(label)
+            self.path_label.setToolTip(folder_path)
+            self.setProperty("has_path", "true")
+        else:
+            self.path_label.setText("Папка не выбрана")
+            self.path_label.setToolTip("")
+            self.setProperty("has_path", "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+
+class LocalePickerWidget(QGroupBox):
+    def __init__(self, locales_map, title="Локали", columns=UI_LOCALE_GRID_COLUMNS, parent=None):
+        super().__init__(title, parent)
+        self._locales_map = locales_map
+        self._columns = max(2, columns)
+        self._checkboxes = {}
+        self._all_codes = []
+        self._filtered_codes = []
+        self._build_ui()
+        self._populate_locales()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        controls_row = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Поиск локали: код или название")
+        self.search_input.textChanged.connect(self._apply_filter)
+        controls_row.addWidget(self.search_input, stretch=1)
+
+        self.btn_select_all = QPushButton("Выбрать все")
+        self.btn_select_all.setObjectName("utility_btn")
+        self.btn_select_all.clicked.connect(lambda: self._set_filtered_checked(True))
+        controls_row.addWidget(self.btn_select_all)
+
+        self.btn_clear_all = QPushButton("Снять все")
+        self.btn_clear_all.setObjectName("utility_btn")
+        self.btn_clear_all.clicked.connect(lambda: self._set_filtered_checked(False))
+        controls_row.addWidget(self.btn_clear_all)
+        layout.addLayout(controls_row)
+
+        self.selection_label = QLabel()
+        self.selection_label.setProperty("role", "hint")
+        layout.addWidget(self.selection_label)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setMinimumHeight(260)
+        self.scroll_widget = QWidget()
+        self.scroll_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.grid = QGridLayout(self.scroll_widget)
+        self.grid.setContentsMargins(8, 8, 8, 8)
+        self.grid.setHorizontalSpacing(14)
+        self.grid.setVerticalSpacing(4)
+        self.grid.setAlignment(Qt.AlignTop)
+        for column in range(self._columns):
+            self.grid.setColumnMinimumWidth(column, UI_LOCALE_COLUMN_MIN_WIDTH)
+            self.grid.setColumnStretch(column, 1)
+        self.scroll_area.setWidget(self.scroll_widget)
+        layout.addWidget(self.scroll_area)
+
+    def _populate_locales(self):
+        sorted_locales = sorted(self._locales_map.items(), key=lambda item: item[1][1])
+        self._all_codes = [code for code, _ in sorted_locales]
+        for code, (country_code, locale_name) in sorted_locales:
+            cb = QCheckBox(f" {locale_name} ({code})")
+            cb.setProperty("locale_code", code)
+            cb.setMinimumWidth(UI_LOCALE_COLUMN_MIN_WIDTH)
+            cb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            icon_path = f".flags_cache/{country_code}.png"
+            if os.path.exists(icon_path):
+                cb.setIcon(QIcon(icon_path))
+                cb.setIconSize(QSize(20, 15))
+            cb.stateChanged.connect(self._update_selection_count)
+            self._checkboxes[code] = cb
+        self._filtered_codes = list(self._all_codes)
+        self._rebuild_grid()
+        self._update_selection_count()
+
+    def _rebuild_grid(self):
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        row, col = 0, 0
+        for code in self._filtered_codes:
+            cb = self._checkboxes[code]
+            self.grid.addWidget(cb, row, col)
+            col += 1
+            if col >= self._columns:
+                col = 0
+                row += 1
+
+    def _update_selection_count(self, *_args):
+        selected = len(self.get_selected_locales())
+        total = len(self._all_codes)
+        visible = len(self._filtered_codes)
+        if visible < total:
+            self.selection_label.setText(
+                f"Выбрано: {selected} из {total} · показано {visible} по фильтру"
+            )
+        else:
+            self.selection_label.setText(f"Выбрано: {selected} из {total}")
+
+    def _apply_filter(self):
+        query = self.search_input.text().strip().lower()
+        if not query:
+            self._filtered_codes = list(self._all_codes)
+        else:
+            filtered = []
+            for code in self._all_codes:
+                _, name = self._locales_map[code]
+                haystack = f"{code} {name}".lower()
+                if query in haystack:
+                    filtered.append(code)
+            self._filtered_codes = filtered
+        self._rebuild_grid()
+
+    def _set_filtered_checked(self, state):
+        for code in self._filtered_codes:
+            self._checkboxes[code].setChecked(state)
+        self._update_selection_count()
+
+    def set_all_checked(self, state):
+        for cb in self._checkboxes.values():
+            cb.setChecked(state)
+        self._update_selection_count()
+
+    def get_selected_locales(self):
+        return [code for code in self._all_codes if self._checkboxes[code].isChecked()]
+
+    def set_selected_locales(self, locale_codes):
+        selected = set(locale_codes)
+        for code, cb in self._checkboxes.items():
+            cb.setChecked(code in selected)
+        self._update_selection_count()
+
+    def set_available_locales(self, locale_codes):
+        self.set_selected_locales(locale_codes)
+
+    def set_compact_height(self, height=380):
+        self.setMaximumHeight(height)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+
+class ScreenshotDropZone(QFrame):
+    files_dropped = Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("drop_zone")
+        self.setAcceptDrops(True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(4)
+        title = QLabel("Перетащите .jpg/.jpeg сюда")
+        title.setProperty("role", "section")
+        hint = QLabel("Или используйте кнопку выбора файлов ниже.")
+        hint.setProperty("role", "hint")
+        layout.addWidget(title)
+        layout.addWidget(hint)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            valid = any(
+                url.toLocalFile().lower().endswith((".jpg", ".jpeg"))
+                for url in event.mimeData().urls()
+            )
+            if valid:
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    def dropEvent(self, event):
+        files = [
+            url.toLocalFile()
+            for url in event.mimeData().urls()
+            if url.toLocalFile().lower().endswith((".jpg", ".jpeg"))
+        ]
+        if files:
+            self.files_dropped.emit(files)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         ensure_flags_downloaded()
         
         self.setWindowTitle("PPO Automation Control (PRO Mode)")
-        self.resize(900, 980)
+        self._initial_width, self._initial_height = default_window_size()
+        self.resize(self._initial_width, self._initial_height)
+        self.setMinimumSize(1280, 820)
         self.variants_paths = {"Variant A": "", "Variant B": "", "Variant C": ""}
         self._setup_ui()
         self._apply_styles()
+        self._apply_display_polish()
         self._ensure_tinypng_key_visible()
 
     def _setup_ui(self):
-        layout = QVBoxLayout(self)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(12, 12, 12, 12)
+        root_layout.setSpacing(10)
 
-        self.lbl_api = QLabel("НАСТРОЙКИ API (Авто-сохранение)")
-        layout.addWidget(self.lbl_api)
+        sorted_locales = sorted(LOCALE_MAP.items(), key=lambda item: item[1][1])
+
+        self.api_panel = CollapsibleApiPanel("Настройки API")
+        api_layout = self.api_panel.body_layout
+
+        api_caption = QLabel("API credentials и ключ TinyPNG сохраняются в .env автоматически.")
+        api_caption.setProperty("role", "hint")
+        api_layout.addWidget(api_caption)
+
+        apple_grid = QGridLayout()
+        apple_grid.setHorizontalSpacing(10)
+        apple_grid.setVerticalSpacing(6)
+        issuer_label = QLabel("Issuer ID")
+        issuer_label.setProperty("role", "section")
+        key_id_label = QLabel("Key ID")
+        key_id_label.setProperty("role", "section")
+        app_id_label = QLabel("App ID")
+        app_id_label.setProperty("role", "section")
+        p8_label = QLabel("Private key (.p8)")
+        p8_label.setProperty("role", "section")
 
         self.issuer_input = QLineEdit(os.getenv("ISSUER_ID", ""))
-        self.issuer_input.setPlaceholderText("ISSUER_ID")
-        layout.addWidget(self.issuer_input)
-
+        self.issuer_input.setPlaceholderText("Issuer ID из App Store Connect")
         self.key_input = QLineEdit(os.getenv("KEY_ID", ""))
-        self.key_input.setPlaceholderText("KEY_ID")
-        layout.addWidget(self.key_input)
-
+        self.key_input.setPlaceholderText("Авто из AuthKey_*.p8")
         self.app_input = QLineEdit(os.getenv("APP_ID", ""))
         self.app_input.setPlaceholderText("APP_ID (Apple ID)")
-        layout.addWidget(self.app_input)
+        self.btn_fetch_app_id = QPushButton("Загрузить App ID")
+        self.btn_fetch_app_id.setObjectName("utility_btn")
+        self.btn_fetch_app_id.setMinimumWidth(140)
+        self.btn_fetch_app_id.clicked.connect(self._fetch_app_ids)
 
-        key_layout = QHBoxLayout()
         self.p8_path_input = QLineEdit(os.getenv("PRIVATE_KEY_PATH", ""))
         self.p8_path_input.setPlaceholderText("Путь к файлу AuthKey_...p8")
         self.p8_path_input.editingFinished.connect(self._autofill_key_id_from_p8_path)
         self.btn_select_p8 = QPushButton("Выбрать .p8")
+        self.btn_select_p8.setObjectName("utility_btn")
+        self.btn_select_p8.setMinimumWidth(140)
         self.btn_select_p8.clicked.connect(self._select_p8_file)
-        key_layout.addWidget(self.p8_path_input)
-        key_layout.addWidget(self.btn_select_p8)
-        layout.addLayout(key_layout)
 
+        apple_grid.addWidget(issuer_label, 0, 0)
+        apple_grid.addWidget(key_id_label, 0, 1)
+        apple_grid.addWidget(app_id_label, 0, 2, 1, 2)
+        apple_grid.addWidget(self.issuer_input, 1, 0)
+        apple_grid.addWidget(self.key_input, 1, 1)
+        apple_grid.addWidget(self.app_input, 1, 2)
+        apple_grid.addWidget(self.btn_fetch_app_id, 1, 3)
+        apple_grid.addWidget(p8_label, 2, 0, 1, 4)
+        apple_grid.addWidget(self.p8_path_input, 3, 0, 1, 3)
+        apple_grid.addWidget(self.btn_select_p8, 3, 3)
+        apple_grid.setColumnStretch(0, 2)
+        apple_grid.setColumnStretch(1, 1)
+        apple_grid.setColumnStretch(2, 2)
+        apple_grid.setColumnStretch(3, 0)
+        api_layout.addLayout(apple_grid)
+
+        tinypng_label = QLabel("TinyPNG API key (сжатие скриншотов)")
+        tinypng_label.setProperty("role", "section")
+        api_layout.addWidget(tinypng_label)
         self.tinypng_key_input = QLineEdit(resolve_tinypng_api_key())
         self.tinypng_key_input.setPlaceholderText("TinyPNG API key (сохраняется в .env)")
         self.tinypng_key_input.editingFinished.connect(self._save_env_to_file)
-        layout.addWidget(QLabel("TinyPNG API key (сжатие скринов, всегда включено):"))
-        layout.addWidget(self.tinypng_key_input)
+        api_layout.addWidget(self.tinypng_key_input)
 
+        gemini_label = QLabel("Gemini API (AI генерация метаданных)")
+        gemini_label.setProperty("role", "section")
+        api_layout.addWidget(gemini_label)
+        gemini_row = QHBoxLayout()
+        self.gemini_key_input = QLineEdit(os.getenv("GEMINI_API_KEY", ""))
+        self.gemini_key_input.setPlaceholderText("Gemini API key")
+        self.gemini_key_input.setEchoMode(QLineEdit.Password)
+        self.gemini_key_input.editingFinished.connect(self._save_env_to_file)
+        self.gemini_model_input = QLineEdit(os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
+        self.gemini_model_input.setPlaceholderText("gemini-2.5-flash")
+        self.gemini_model_input.editingFinished.connect(self._save_env_to_file)
+        gemini_row.addWidget(self.gemini_key_input, stretch=2)
+        gemini_row.addWidget(self.gemini_model_input, stretch=1)
+        api_layout.addLayout(gemini_row)
+        root_layout.addWidget(self.api_panel)
+
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
         self.tabs = QTabWidget()
-        layout.addWidget(self.tabs)
+        left_layout.addWidget(self.tabs)
+        self.main_splitter.addWidget(left_panel)
+
+        right_panel = QWidget()
+        right_panel.setObjectName("execution_panel")
+        right_panel.setMinimumWidth(380)
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(14, 14, 14, 14)
+        right_layout.setSpacing(10)
+        right_layout.addWidget(make_page_header(
+            "Статус выполнения",
+            "Прогресс задач и журнал операций в реальном времени."
+        ))
+
+        progress_layout = QHBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.time_label = QLabel("Осталось: --:--")
+        self.time_label.setFixedWidth(150)
+        self.time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        progress_layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.time_label)
+        right_layout.addLayout(progress_layout)
+
+        self.log_area = QTextEdit()
+        self.log_area.setObjectName("log_area")
+        self.log_area.setReadOnly(True)
+        self.log_area.setMinimumHeight(UI_LOG_MIN_HEIGHT)
+        right_layout.addWidget(self.log_area, stretch=1)
+        self.main_splitter.addWidget(right_panel)
+        self.main_splitter.setStretchFactor(0, 7)
+        self.main_splitter.setStretchFactor(1, 3)
+        left_width = int(self._initial_width * 0.68)
+        right_width = max(380, self._initial_width - left_width)
+        self.main_splitter.setSizes([left_width, right_width])
+        root_layout.addWidget(self.main_splitter, stretch=1)
 
         self.tab_create = QWidget()
-        create_layout = QVBoxLayout(self.tab_create)
+        create_outer = QVBoxLayout(self.tab_create)
+        create_outer.setContentsMargins(0, 0, 0, 0)
+        create_scroll = QScrollArea()
+        create_scroll.setWidgetResizable(True)
+        create_scroll.setFrameShape(QFrame.NoFrame)
+        create_inner = QWidget()
+        create_layout = QVBoxLayout(create_inner)
+        create_layout.setSpacing(12)
+        create_layout.setContentsMargins(4, 4, 12, 12)
+        create_scroll.setWidget(create_inner)
+        create_outer.addWidget(create_scroll)
+
+        create_layout.addWidget(make_page_header(
+            "Новый PPO-тест",
+            "Создайте эксперимент в App Store Connect и подготовьте папки скриншотов для вариантов."
+        ))
         self.create_name_input = QLineEdit()
         self.create_name_input.setPlaceholderText("Имя нового теста (например: New Icon Test)")
         self.create_traffic_input = QLineEdit("75")
         self.create_traffic_input.setPlaceholderText("Трафик (например: 75)")
-        create_layout.addWidget(QLabel("Введите имя для нового теста в App Store Connect:"))
-        create_layout.addWidget(self.create_name_input)
-        create_layout.addWidget(QLabel("Процент трафика:"))
-        create_layout.addWidget(self.create_traffic_input)
+        self.create_traffic_input.setMaximumWidth(140)
+        create_fields_row = QHBoxLayout()
+        name_col = QVBoxLayout()
+        name_col.addWidget(QLabel("Имя теста"))
+        name_col.addWidget(self.create_name_input)
+        traffic_col = QVBoxLayout()
+        traffic_col.addWidget(QLabel("Процент трафика"))
+        traffic_col.addWidget(self.create_traffic_input)
+        create_fields_row.addLayout(name_col, stretch=3)
+        create_fields_row.addLayout(traffic_col, stretch=1)
+        create_layout.addLayout(create_fields_row)
+        self.create_variants_group = self._build_variant_cards_group("Скриншоты вариантов для нового теста")
+        create_layout.addWidget(self.create_variants_group)
         create_layout.addStretch()
-        self.tabs.addTab(self.tab_create, "🆕 СОЗДАТЬ НОВЫЙ ТЕСТ")
+        self.tabs.addTab(self.tab_create, "Новый тест")
 
         self.tab_update = QWidget()
-        update_layout = QVBoxLayout(self.tab_update)
+        update_outer = QVBoxLayout(self.tab_update)
+        update_outer.setContentsMargins(0, 0, 0, 0)
+        update_scroll = QScrollArea()
+        update_scroll.setWidgetResizable(True)
+        update_scroll.setFrameShape(QFrame.NoFrame)
+        update_inner = QWidget()
+        update_layout = QVBoxLayout(update_inner)
+        update_layout.setSpacing(12)
+        update_layout.setContentsMargins(4, 4, 12, 12)
+        update_scroll.setWidget(update_inner)
+        update_outer.addWidget(update_scroll)
         
+        update_layout.addWidget(make_page_header(
+            "Обновление PPO-теста",
+            "Выберите существующий тест, варианты, папки и локали для точечного обновления."
+        ))
         update_layout.addWidget(QLabel("1. Выберите существующий тест из App Store Connect:"))
         
         test_select_layout = QHBoxLayout()
         self.update_name_combo = QComboBox()
         self.btn_fetch_tests = QPushButton("🔄 Загрузить список")
+        self.btn_fetch_tests.setObjectName("utility_btn")
         self.btn_fetch_tests.clicked.connect(self._fetch_tests)
         
         test_select_layout.addWidget(self.update_name_combo, stretch=1)
@@ -1820,104 +2739,90 @@ class MainWindow(QWidget):
         var_layout.addWidget(self.chk_var_b)
         var_layout.addWidget(self.chk_var_c)
         update_layout.addLayout(var_layout)
+        self.update_variants_group = self._build_variant_cards_group("Папки скриншотов для update-режима")
+        update_layout.addWidget(self.update_variants_group)
 
         update_layout.addWidget(QLabel("3. Выберите локали для обновления:"))
+        self.update_locale_picker = LocalePickerWidget(LOCALE_MAP, "Локали обновления")
+        update_layout.addWidget(self.update_locale_picker)
         
-        btn_layout = QHBoxLayout()
-        btn_sel_all = QPushButton("Выбрать все")
-        btn_desel_all = QPushButton("Снять все")
-        btn_sel_all.clicked.connect(lambda: self._toggle_locales(True))
-        btn_desel_all.clicked.connect(lambda: self._toggle_locales(False))
-        btn_layout.addWidget(btn_sel_all)
-        btn_layout.addWidget(btn_desel_all)
-        update_layout.addLayout(btn_layout)
-
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_widget = QWidget()
-        grid = QGridLayout(scroll_widget)
-        
-        self.locale_checkboxes = []
-        sorted_locales = sorted(LOCALE_MAP.items(), key=lambda item: item[1][1])
-        
-        row, col = 0, 0
-        for code, (cc, name) in sorted_locales:
-            cb = QCheckBox(f" {name}")
-            cb.setProperty("locale_code", code)
-            
-            icon_path = f".flags_cache/{cc}.png"
-            if os.path.exists(icon_path):
-                cb.setIcon(QIcon(icon_path))
-                cb.setIconSize(QSize(20, 15))
-                
-            self.locale_checkboxes.append(cb)
-            grid.addWidget(cb, row, col)
-            col += 1
-            if col > 3:
-                col = 0
-                row += 1
-                
-        scroll_area.setWidget(scroll_widget)
-        update_layout.addWidget(scroll_area)
-        
-        self.tabs.addTab(self.tab_update, "🔄 ОБНОВИТЬ СУЩЕСТВУЮЩИЙ")
+        self.tabs.addTab(self.tab_update, "Обновить тест")
 
         self.tab_metadata = QWidget()
         metadata_layout = QVBoxLayout(self.tab_metadata)
-        metadata_layout.addWidget(QLabel("Первичная загрузка метаданных приложения через GUI:"))
-        metadata_layout.addWidget(QLabel(
-            "Заполните поля ниже — программа сама соберет payload для App Store Connect. "
+        metadata_layout.setContentsMargins(4, 4, 4, 4)
+        metadata_layout.addWidget(make_page_header(
+            "Метаданные приложения",
+            "Заполните поля ниже — программа соберет payload для App Store Connect. "
             "JSON оставлен только для продвинутых custom_requests."
         ))
 
-        metadata_buttons_layout = QHBoxLayout()
         self.btn_load_metadata_json = QPushButton("📄 Импорт JSON в поля")
+        self.btn_load_metadata_json.setObjectName("utility_btn")
         self.btn_load_metadata_json.clicked.connect(self._load_metadata_json)
+        self.btn_load_metadata_json.setVisible(False)
         self.btn_insert_metadata_example = QPushButton("🧩 Заполнить пример")
+        self.btn_insert_metadata_example.setObjectName("utility_btn")
         self.btn_insert_metadata_example.clicked.connect(self._insert_metadata_example)
+        self.btn_insert_metadata_example.setVisible(False)
         self.btn_preview_metadata = QPushButton("🔍 Preview & Validate")
+        self.btn_preview_metadata.setObjectName("utility_btn")
         self.btn_preview_metadata.clicked.connect(self._preview_metadata)
-        self.btn_pull_metadata = QPushButton("⬇️ Pull from Apple")
-        self.btn_pull_metadata.clicked.connect(self._pull_metadata_from_apple)
-        metadata_buttons_layout.addWidget(self.btn_load_metadata_json)
-        metadata_buttons_layout.addWidget(self.btn_insert_metadata_example)
-        metadata_buttons_layout.addWidget(self.btn_preview_metadata)
-        metadata_buttons_layout.addWidget(self.btn_pull_metadata)
-        metadata_layout.addLayout(metadata_buttons_layout)
+        self.btn_preview_metadata.setVisible(False)
 
         metadata_scroll = QScrollArea()
         metadata_scroll.setWidgetResizable(True)
         metadata_widget = QWidget()
         metadata_form_layout = QVBoxLayout(metadata_widget)
 
+        source_group = QGroupBox("Источник данных")
+        source_layout = QHBoxLayout(source_group)
+        source_layout.setContentsMargins(12, 14, 12, 10)
+        source_layout.setSpacing(12)
+        source_summary_row = QHBoxLayout()
+        self.meta_source_locale_label = QLabel("Локаль: —")
+        self.meta_source_locale_label.setProperty("role", "section")
+        self.meta_source_version_label = QLabel("Версия: —")
+        self.meta_source_version_label.setProperty("role", "section")
+        source_summary_row.addWidget(self.meta_source_locale_label, stretch=1)
+        source_summary_row.addWidget(self.meta_source_version_label, stretch=1)
+        source_layout.addLayout(source_summary_row, stretch=1)
+        self.btn_pull_metadata = QPushButton("⬇️ Pull")
+        self.btn_pull_metadata.setObjectName("start_btn")
+        self.btn_pull_metadata.setMinimumHeight(46)
+        self.btn_pull_metadata.setMinimumWidth(125)
+        self.btn_pull_metadata.clicked.connect(self._pull_metadata_from_apple)
+        source_layout.addWidget(self.btn_pull_metadata)
+        metadata_form_layout.addWidget(source_group)
+
         locale_group = QGroupBox("Локаль")
         locale_form = QFormLayout(locale_group)
         self.meta_locale_combo = QComboBox()
-        for code, (_, name) in sorted(LOCALE_MAP.items(), key=lambda item: item[1][1]):
+        for code, (_, name) in sorted_locales:
             self.meta_locale_combo.addItem(f"{name} ({code})", code)
         default_locale_index = self.meta_locale_combo.findData("en-US")
         if default_locale_index >= 0:
             self.meta_locale_combo.setCurrentIndex(default_locale_index)
-        locale_select_layout = QHBoxLayout()
-        self.btn_fetch_primary_locale = QPushButton("🌐 Взять primary locale из Apple")
-        self.btn_fetch_primary_locale.clicked.connect(self._fetch_primary_locale)
-        locale_select_layout.addWidget(self.meta_locale_combo, stretch=1)
-        locale_select_layout.addWidget(self.btn_fetch_primary_locale)
-        locale_form.addRow("Язык:", locale_select_layout)
+        locale_form.addRow("Язык:", self.meta_locale_combo)
+
+        self.meta_app_version_input = QLineEdit("")
+        self.meta_app_version_input.setPlaceholderText("Версия из App Store Connect")
+        self.meta_app_version_input.setReadOnly(True)
+        locale_form.addRow("Версия:", self.meta_app_version_input)
         metadata_form_layout.addWidget(locale_group)
 
         version_group = QGroupBox("Version metadata")
         version_form = QFormLayout(version_group)
         self.meta_description_input = QTextEdit()
-        self.meta_description_input.setFixedHeight(110)
+        self.meta_description_input.setFixedHeight(132)
         self.meta_description_input.setPlaceholderText("Description / описание приложения")
         self.meta_keywords_input = QLineEdit()
         self.meta_keywords_input.setPlaceholderText("keyword1,keyword2,keyword3")
         self.meta_promotional_text_input = QTextEdit()
-        self.meta_promotional_text_input.setFixedHeight(70)
+        self.meta_promotional_text_input.setFixedHeight(96)
         self.meta_promotional_text_input.setPlaceholderText("Promotional text")
         self.meta_whats_new_input = QTextEdit()
-        self.meta_whats_new_input.setFixedHeight(80)
+        self.meta_whats_new_input.setFixedHeight(104)
         self.meta_whats_new_input.setPlaceholderText(
             "Только для обновлений (1.0.1+). Первая версия — оставьте пустым."
         )
@@ -1992,7 +2897,7 @@ class MainWindow(QWidget):
         self.meta_review_phone_input.setPlaceholderText("+1 555 010 0611")
         self.meta_review_email_input = QLineEdit()
         self.meta_review_notes_input = QTextEdit()
-        self.meta_review_notes_input.setFixedHeight(90)
+        self.meta_review_notes_input.setFixedHeight(112)
         review_form.addRow("Contact first name:", self.meta_review_first_name_input)
         review_form.addRow("Contact last name:", self.meta_review_last_name_input)
         review_form.addRow("Contact phone:", self.meta_review_phone_input)
@@ -2003,26 +2908,22 @@ class MainWindow(QWidget):
         ai_group = QGroupBox("AI генерация (Gemini)")
         ai_layout = QVBoxLayout(ai_group)
         ai_form = QFormLayout()
-        self.gemini_key_input = QLineEdit(os.getenv("GEMINI_API_KEY", ""))
-        self.gemini_key_input.setPlaceholderText("Gemini API key")
-        self.gemini_key_input.setEchoMode(QLineEdit.Password)
-        self.gemini_model_input = QLineEdit(os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
-        self.gemini_model_input.setPlaceholderText("gemini-2.5-flash")
+        gemini_settings_hint = QLabel("Gemini API key и model теперь находятся в верхнем блоке «Настройки API».")
+        gemini_settings_hint.setProperty("role", "hint")
+        ai_layout.addWidget(gemini_settings_hint)
         self.ai_developer_name_input = QLineEdit("")
         self.ai_developer_name_input.setPlaceholderText("Developer name для App Review notes")
         self.ai_developer_name_input.textChanged.connect(self._apply_developer_name_to_review_fields)
         self.ai_app_context_input = QTextEdit()
-        self.ai_app_context_input.setFixedHeight(110)
+        self.ai_app_context_input.setFixedHeight(132)
         self.ai_app_context_input.setPlaceholderText("Вставьте ТЗ: смысл приложения, функционал, аудитория, ограничения, что точно есть/нет...")
         self.ai_prompt_profile_combo = QComboBox()
         self.ai_prompt_profiles = self._load_prompt_profiles()
         self.ai_prompt_profile_combo.addItems(self.ai_prompt_profiles.keys())
         self.ai_prompt_input = QTextEdit()
-        self.ai_prompt_input.setFixedHeight(180)
+        self.ai_prompt_input.setFixedHeight(220)
         self.ai_prompt_input.setPlaceholderText("Вставьте свой промт для Gemini: стиль description, правила keywords, category, notes...")
         self.ai_prompt_input.setPlainText(self.ai_prompt_profiles.get("Human premium ASO", DEFAULT_GEMINI_PROMPT))
-        ai_form.addRow("Gemini API key:", self.gemini_key_input)
-        ai_form.addRow("Model:", self.gemini_model_input)
         ai_form.addRow("Developer name:", self.ai_developer_name_input)
         ai_form.addRow("ТЗ / brief приложения:", self.ai_app_context_input)
         ai_form.addRow("Prompt profile:", self.ai_prompt_profile_combo)
@@ -2082,7 +2983,7 @@ class MainWindow(QWidget):
         custom_layout = QVBoxLayout(custom_group)
         custom_layout.addWidget(QLabel("Для app privacy / availability можно вставить массив custom_requests в JSON-формате:"))
         self.metadata_text = QTextEdit()
-        self.metadata_text.setFixedHeight(90)
+        self.metadata_text.setFixedHeight(112)
         self.metadata_text.setPlaceholderText('[{"method":"PATCH","endpoint":"...","payload":{...}}]')
         custom_layout.addWidget(self.metadata_text)
         metadata_form_layout.addWidget(custom_group)
@@ -2095,177 +2996,437 @@ class MainWindow(QWidget):
 
         metadata_scroll.setWidget(metadata_widget)
         metadata_layout.addWidget(metadata_scroll)
-        self.tabs.addTab(self.tab_metadata, "🧾 ПЕРВИЧНАЯ ЗАГРУЗКА")
+        self.tabs.addTab(self.tab_metadata, "Метаданные")
+
+        self.tab_translation = QWidget()
+        translation_outer = QVBoxLayout(self.tab_translation)
+        translation_outer.setContentsMargins(0, 0, 0, 0)
+        translation_scroll = QScrollArea()
+        translation_scroll.setWidgetResizable(True)
+        translation_scroll.setFrameShape(QFrame.NoFrame)
+        translation_inner = QWidget()
+        translation_layout = QVBoxLayout(translation_inner)
+        translation_layout.setSpacing(12)
+        translation_layout.setContentsMargins(4, 4, 12, 12)
+        translation_scroll.setWidget(translation_inner)
+        translation_outer.addWidget(translation_scroll)
+
+        translation_layout.addWidget(make_page_header(
+            "Перевод локализаций",
+            "Pull source из Apple, перевод через Gemini, preview/edit и batch upload в App Store Connect."
+        ))
+
+        source_group = QGroupBox("Source locale")
+        source_form = QFormLayout(source_group)
+        self.translation_source_locale_combo = QComboBox()
+        for code, (_, name) in sorted_locales:
+            self.translation_source_locale_combo.addItem(f"{name} ({code})", code)
+        source_default_idx = self.translation_source_locale_combo.findData("en-US")
+        if source_default_idx >= 0:
+            self.translation_source_locale_combo.setCurrentIndex(source_default_idx)
+        source_controls_row = QHBoxLayout()
+        self.btn_translation_auto_source = QPushButton("Auto source from Apple")
+        self.btn_translation_auto_source.setObjectName("utility_btn")
+        self.btn_translation_auto_source.clicked.connect(self._fetch_translation_source_auto)
+        source_controls_row.addWidget(self.translation_source_locale_combo, stretch=1)
+        source_controls_row.addWidget(self.btn_translation_auto_source)
+        source_form.addRow("Исходная локаль:", source_controls_row)
+        self.translation_source_info = QLabel("Source metadata еще не загружен.")
+        self.translation_source_info.setProperty("role", "hint")
+        source_form.addRow("Source status:", self.translation_source_info)
+        translation_layout.addWidget(source_group)
+
+        self.translation_target_picker = LocalePickerWidget(LOCALE_MAP, "Целевые локали")
+        translation_layout.addWidget(self.translation_target_picker)
+
+        fields_group = QGroupBox("Поля для перевода")
+        fields_layout = QHBoxLayout(fields_group)
+        self.translation_field_checks = {}
+        for field_key, field_label, _limit, _target in TRANSLATION_FIELDS:
+            cb = QCheckBox(field_label)
+            cb.setChecked(field_key in {"description", "keywords", "promotionalText", "subtitle"})
+            self.translation_field_checks[field_key] = cb
+            fields_layout.addWidget(cb)
+        translation_layout.addWidget(fields_group)
+
+        profile_group = QGroupBox("AI Translation Profile")
+        profile_layout = QFormLayout(profile_group)
+        self.translation_profile_combo = QComboBox()
+        self.translation_profile_combo.addItems(list(TRANSLATION_PROFILES.keys()))
+        profile_layout.addRow("Профиль:", self.translation_profile_combo)
+        translation_layout.addWidget(profile_group)
+
+        translation_actions = QHBoxLayout()
+        self.btn_translation_translate = QPushButton("Перевести")
+        self.btn_translation_translate.setObjectName("start_btn")
+        self.btn_translation_translate.clicked.connect(self._translate_localizations)
+        self.btn_translation_validate = QPushButton("Validate")
+        self.btn_translation_validate.setObjectName("utility_btn")
+        self.btn_translation_validate.clicked.connect(self._validate_translation_table)
+        self.btn_translation_upload = QPushButton("Загрузить переводы в Apple")
+        self.btn_translation_upload.setObjectName("utility_btn")
+        self.btn_translation_upload.clicked.connect(self._upload_translation_rows)
+        translation_actions.addWidget(self.btn_translation_translate)
+        translation_actions.addWidget(self.btn_translation_validate)
+        translation_actions.addWidget(self.btn_translation_upload)
+        translation_layout.addLayout(translation_actions)
+
+        self.translation_table = QTableWidget(0, 6)
+        self.translation_table.setHorizontalHeaderLabels([
+            "Locale", "Field", "Source", "Translation", "Status", "Warning"
+        ])
+        self.translation_table.horizontalHeader().setStretchLastSection(True)
+        self.translation_table.setWordWrap(True)
+        self.translation_table.itemChanged.connect(self._on_translation_item_changed)
+        translation_layout.addWidget(self.translation_table, stretch=1)
+        self.translation_table_busy = False
+        self.translation_source_payload = {}
+        self.translation_version_id = ""
+        self.translation_app_info_id = ""
+
+        self.tabs.addTab(self.tab_translation, "Перевод локализации")
+
         self.tab_screens_upload = QWidget()
-        screens_upload_layout = QVBoxLayout(self.tab_screens_upload)
-        screens_upload_layout.addWidget(QLabel("Загрузка скринов (.jpeg) в App Store Connect на target 6.9 inch."))
-        screens_upload_layout.addWidget(QLabel(
-            "Порядок: «ПЕРВИЧНАЯ ЗАГРУЗКА» (метаданные) → TinyPNG → upload сюда. "
+        screens_outer = QVBoxLayout(self.tab_screens_upload)
+        screens_outer.setContentsMargins(0, 0, 0, 0)
+        screens_scroll = QScrollArea()
+        screens_scroll.setWidgetResizable(True)
+        screens_scroll.setFrameShape(QFrame.NoFrame)
+        screens_inner = QWidget()
+        screens_upload_layout = QVBoxLayout(screens_inner)
+        screens_upload_layout.setSpacing(12)
+        screens_upload_layout.setContentsMargins(4, 4, 12, 12)
+        screens_scroll.setWidget(screens_inner)
+        screens_outer.addWidget(screens_scroll)
+        screens_upload_layout.addWidget(make_page_header(
+            "Загрузка скриншотов",
+            "Порядок: «Метаданные» → TinyPNG → upload сюда. "
             "Или включите авто-цепочку на вкладке метаданных."
         ))
-        self.btn_refresh_locales = QPushButton("🔄 Обновить локали")
+        self.btn_refresh_locales = QPushButton("🔄 Взять активные локали из Apple")
+        self.btn_refresh_locales.setObjectName("utility_btn")
         self.btn_refresh_locales.clicked.connect(self._refresh_screenshot_locales)
         screens_upload_layout.addWidget(self.btn_refresh_locales)
+        self.upload_locale_picker = LocalePickerWidget(LOCALE_MAP, "Локали для скриншотов", columns=6)
+        self.upload_locale_picker.set_compact_height(445)
+        screens_upload_layout.addWidget(self.upload_locale_picker)
 
-        upload_scroll = QScrollArea()
-        upload_scroll.setWidgetResizable(True)
-        upload_scroll_widget = QWidget()
-        upload_grid = QGridLayout(upload_scroll_widget)
-        self.upload_locale_checkboxes = []
-        sorted_locales = sorted(LOCALE_MAP.items(), key=lambda item: item[1][1])
-        row, col = 0, 0
-        for code, (cc, name) in sorted_locales:
-            cb = QCheckBox(f" {name}")
-            cb.setProperty("locale_code", code)
-            icon_path = f".flags_cache/{cc}.png"
-            if os.path.exists(icon_path):
-                cb.setIcon(QIcon(icon_path))
-                cb.setIconSize(QSize(20, 15))
-            self.upload_locale_checkboxes.append(cb)
-            upload_grid.addWidget(cb, row, col)
-            col += 1
-            if col > 3:
-                col = 0
-                row += 1
-        upload_scroll.setWidget(upload_scroll_widget)
-        screens_upload_layout.addWidget(upload_scroll)
-
+        upload_files_group = QGroupBox("Файлы и запуск")
+        upload_files_layout = QVBoxLayout(upload_files_group)
+        upload_files_layout.setSpacing(10)
+        self.upload_summary_label = QLabel("Локалей: 0 · Файлов: 0 · Всего upload задач: 0")
+        self.upload_summary_label.setProperty("role", "section")
+        upload_files_layout.addWidget(self.upload_summary_label)
+        self.screenshot_drop_zone = ScreenshotDropZone()
+        self.screenshot_drop_zone.files_dropped.connect(self._set_upload_jpeg_files)
+        upload_files_layout.addWidget(self.screenshot_drop_zone)
         files_layout = QHBoxLayout()
         self.btn_select_jpegs = QPushButton("📎 Выбрать .jpeg файлы")
+        self.btn_select_jpegs.setObjectName("utility_btn")
         self.btn_select_jpegs.clicked.connect(self._select_jpeg_files)
         self.lbl_selected_jpegs = QLabel("Файлы не выбраны")
+        self.lbl_selected_jpegs.setProperty("role", "hint")
         files_layout.addWidget(self.btn_select_jpegs)
         files_layout.addWidget(self.lbl_selected_jpegs, stretch=1)
-        screens_upload_layout.addLayout(files_layout)
+        upload_files_layout.addLayout(files_layout)
+        self.upload_files_preview = QListWidget()
+        self.upload_files_preview.setMaximumHeight(120)
+        upload_files_layout.addWidget(self.upload_files_preview)
+        self.upload_files_warning = QLabel("")
+        self.upload_files_warning.setProperty("role", "hint")
+        upload_files_layout.addWidget(self.upload_files_warning)
         self.upload_jpeg_files = []
-        self.btn_execute_upload = QPushButton("⬆️ Upload")
+        for checkbox in self.upload_locale_picker._checkboxes.values():
+            checkbox.stateChanged.connect(self._update_upload_summary)
+        self._update_upload_summary()
+        self._update_upload_files_warning()
+        self.btn_execute_upload = QPushButton("⬆️ ЗАГРУЗИТЬ СКРИНШОТЫ В APPLE")
+        self.btn_execute_upload.setObjectName("upload_cta_btn")
+        self.btn_execute_upload.setMinimumHeight(64)
         self.btn_execute_upload.clicked.connect(self._start_screenshot_upload)
-        screens_upload_layout.addWidget(self.btn_execute_upload)
-        self.tabs.addTab(self.tab_screens_upload, "🖼️ ЗАГРУЗКА СКРИНОВ")
-
-        self.lbl_folders = QLabel("ВЫБОР СКРИНШОТОВ (Для PPO режимов)")
-        self.lbl_folders.setContentsMargins(0, 10, 0, 5)
-        layout.addWidget(self.lbl_folders)
-
-        self.btn_a = QPushButton("Выбрать папку: Variant A")
-        self.btn_a.clicked.connect(lambda: self._select_folder("Variant A", self.btn_a))
-        layout.addWidget(self.btn_a)
-
-        self.btn_b = QPushButton("Выбрать папку: Variant B")
-        self.btn_b.clicked.connect(lambda: self._select_folder("Variant B", self.btn_b))
-        layout.addWidget(self.btn_b)
-
-        self.btn_c = QPushButton("Выбрать папку: Variant C")
-        self.btn_c.clicked.connect(lambda: self._select_folder("Variant C", self.btn_c))
-        layout.addWidget(self.btn_c)
-
-        self.screenshot_controls = [self.lbl_folders, self.btn_a, self.btn_b, self.btn_c]
-
-        progress_layout = QHBoxLayout()
-        progress_layout.setContentsMargins(0, 10, 0, 0)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
-        self.time_label = QLabel("Осталось: --:--")
-        self.time_label.setFixedWidth(120)
-        self.time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        progress_layout.addWidget(self.progress_bar)
-        progress_layout.addWidget(self.time_label)
-        layout.addLayout(progress_layout)
-
-        self.log_area = QTextEdit()
-        self.log_area.setReadOnly(True)
-        layout.addWidget(self.log_area)
+        upload_files_layout.addWidget(self.btn_execute_upload)
+        screens_upload_layout.addWidget(upload_files_group)
+        screens_upload_layout.addStretch(1)
+        self.tabs.addTab(self.tab_screens_upload, "Скриншоты")
 
         self.start_btn = QPushButton("🚀 ЗАПУСТИТЬ ПРОЦЕСС")
         self.start_btn.setObjectName("start_btn") 
-        self.start_btn.setMinimumHeight(45)
+        self.start_btn.setMinimumHeight(52)
         self.start_btn.clicked.connect(self._start_process)
-        layout.addWidget(self.start_btn)
+        root_layout.addWidget(self.start_btn)
 
+        for widget in [
+            self.issuer_input, self.key_input, self.app_input, self.p8_path_input,
+            self.tinypng_key_input, self.gemini_key_input, self.gemini_model_input
+        ]:
+            widget.textChanged.connect(self._update_api_summary)
+        self._update_api_summary()
+        if self._has_complete_api_credentials():
+            self.api_panel.setChecked(False)
+        self._refresh_variant_cards()
         self.tabs.currentChanged.connect(self._on_tab_change)
         self._on_tab_change(self.tabs.currentIndex())
+
+    def _build_variant_cards_group(self, title):
+        group = QGroupBox(title)
+        layout = QGridLayout(group)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(10)
+        if not hasattr(self, "variant_cards"):
+            self.variant_cards = {}
+        for column, variant_name in enumerate(("Variant A", "Variant B", "Variant C")):
+            card = VariantFolderCard(variant_name)
+            card.select_requested.connect(self._select_folder)
+            layout.addWidget(card, 0, column)
+            self.variant_cards.setdefault(variant_name, []).append(card)
+        return group
+
+    def _refresh_variant_cards(self):
+        for variant_name, cards in getattr(self, "variant_cards", {}).items():
+            current_path = self.variants_paths.get(variant_name, "")
+            for card in cards:
+                card.set_path(current_path)
+
+    def _has_complete_api_credentials(self):
+        return all([
+            self.issuer_input.text().strip(),
+            self.key_input.text().strip(),
+            self.app_input.text().strip(),
+            self.p8_path_input.text().strip(),
+        ])
+
+    def _update_api_summary(self):
+        missing = []
+        fields = [
+            ("Issuer", self.issuer_input.text().strip()),
+            ("Key ID", self.key_input.text().strip()),
+            ("App ID", self.app_input.text().strip()),
+            ("P8 path", self.p8_path_input.text().strip()),
+        ]
+        for field_name, value in fields:
+            if not value:
+                missing.append(field_name)
+        app_id = self.app_input.text().strip() or "—"
+        if missing:
+            summary = f"Не заполнено: {', '.join(missing)} | App ID: {app_id}"
+            self.api_panel.set_summary(summary, status="warn")
+        else:
+            summary = f"Готово к запуску | App ID: {app_id}"
+            self.api_panel.set_summary(summary, status="ok")
+
+    def _extract_key_id_from_p8_path(self):
+        filename = os.path.basename(self.p8_path_input.text().strip())
+        if not filename:
+            return ""
+        match = re.match(r"^AuthKey_([A-Za-z0-9]+)\.p8$", filename, re.IGNORECASE)
+        return match.group(1) if match else ""
+
+    def _apply_display_polish(self):
+        app = QApplication.instance()
+        if app is not None:
+            app.setFont(QFont("Segoe UI", UI_FONT_BASE_PT))
+        self.log_area.setFont(QFont("Cascadia Mono", 12))
+        self.tabs.tabBar().setExpanding(False)
+        self.tabs.tabBar().setUsesScrollButtons(True)
 
     def _apply_styles(self):
         self.setStyleSheet("""
             QWidget { 
-                background-color: #1E1E1E; 
-                color: #D4D4D4; 
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
-                font-size: 13px; 
+                background-color: #0B1020; 
+                color: #EAF0FF; 
+                font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif; 
+                font-size: 14px; 
             }
-            QLabel { font-weight: 600; color: #E0E0E0; }
-            QPushButton { 
-                background-color: #2D2D30; 
-                border: 1px solid #3E3E42; 
-                border-radius: 6px;
-                padding: 8px; 
-                color: #FFFFFF;
-                font-weight: bold; 
-            }
-            QPushButton:hover { background-color: #3E3E42; border-color: #00D100; }
-            QPushButton:disabled { background-color: #252526; border-color: #2D2D30; color: #7A7A7A; }
-            
-            QPushButton#start_btn {
-                background-color: #00D100;
-                color: #050805;
-                font-size: 14px;
+            QLabel { color: #EAF0FF; font-weight: 500; background: transparent; }
+            QLabel[role="title"] { font-size: 20px; color: #F7FAFF; font-weight: 700; letter-spacing: 0.2px; }
+            QLabel[role="section"] { font-size: 12px; color: #9FB2D8; font-weight: 700; text-transform: uppercase; }
+            QLabel[role="hint"] { color: #93A4C8; font-weight: 400; font-size: 13px; }
+            QLabel[status="ok"] { color: #4ADE80; font-weight: 600; }
+            QLabel[status="warn"] { color: #FBBF24; font-weight: 600; }
+
+            QWidget#page_header {
+                background: transparent;
                 border: none;
             }
-            QPushButton#start_btn:hover { background-color: #00ED00; }
-            QPushButton#start_btn:disabled { background-color: #2D2D30; color: #7A7A7A; }
+
+            QWidget#execution_panel {
+                background-color: #0D1728;
+                border: 1px solid #26324A;
+                border-radius: 10px;
+                padding: 8px;
+            }
+
+            QGroupBox {
+                border: 1px solid #26324A;
+                border-radius: 10px;
+                margin-top: 10px;
+                padding-top: 14px;
+                background-color: #111827;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 6px;
+                color: #C7D2FE;
+                font-weight: 700;
+            }
+            QGroupBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                background: #0F172A;
+            }
+            QGroupBox::indicator:hover {
+                border: 1px solid #7C9CFF;
+            }
+            QGroupBox::indicator:checked {
+                background: #6D8DFF;
+                border: 1px solid #8EA5FF;
+            }
+
+            QPushButton { 
+                background-color: #172033; 
+                border: 1px solid #2C3B5A; 
+                border-radius: 8px;
+                padding: 9px 12px; 
+                color: #F7FAFF;
+                font-weight: 600; 
+            }
+            QPushButton:hover { background-color: #1E2A44; border-color: #4F8CFF; }
+            QPushButton:disabled { background-color: #101828; border-color: #1E293B; color: #64748B; }
+            
+            QPushButton#start_btn {
+                background-color: #6D8DFF;
+                color: #07111F;
+                font-size: 15px;
+                border: 1px solid #8EA5FF;
+                border-radius: 10px;
+                font-weight: 700;
+                padding: 12px 16px;
+            }
+            QPushButton#start_btn:hover { background-color: #7C9CFF; border-color: #A3B7FF; }
+            QPushButton#start_btn:disabled { background-color: #1E293B; color: #64748B; border-color: #334155; }
+
+            QPushButton#upload_cta_btn {
+                background-color: #6D8DFF;
+                color: #07111F;
+                font-size: 16px;
+                border: 1px solid #8EA5FF;
+                border-radius: 12px;
+                font-weight: 800;
+                padding: 14px 18px;
+            }
+            QPushButton#upload_cta_btn:hover { background-color: #7C9CFF; border-color: #A3B7FF; }
+            QPushButton#upload_cta_btn:disabled { background-color: #1E293B; color: #64748B; border-color: #334155; }
 
             QPushButton#utility_btn {
-                padding: 6px;
-                font-size: 12px;
-                color: #D4D4D4;
+                padding: 7px 10px;
+                font-size: 13px;
+                color: #DCE7FF;
+                font-weight: 500;
+                background-color: #151F32;
             }
+            QPushButton#utility_btn:hover { background-color: #1D2A44; }
             QPushButton#main_generate_btn {
-                background-color: #00D100;
-                color: #050805;
+                background-color: #6D8DFF;
+                color: #07111F;
                 font-size: 15px;
                 border: none;
                 font-weight: 700;
             }
-            QPushButton#main_generate_btn:hover { background-color: #00ED00; }
-            QPushButton#main_generate_btn:disabled { background-color: #2D2D30; color: #7A7A7A; }
+            QPushButton#main_generate_btn:hover { background-color: #7C9CFF; }
+            QPushButton#main_generate_btn:disabled { background-color: #1E293B; color: #64748B; }
             
             QLineEdit, QTextEdit, QComboBox { 
-                background-color: #252526; 
-                border: 1px solid #3E3E42; 
-                border-radius: 5px;
-                padding: 8px; 
-                color: #FFFFFF; 
-                selection-background-color: #00D100;
-                selection-color: #050805;
+                background-color: #0F172A; 
+                border: 1px solid #2B3A55; 
+                border-radius: 8px;
+                padding: 7px 10px; 
+                color: #F8FAFC; 
+                min-height: 24px;
+                selection-background-color: #6D8DFF;
+                selection-color: #07111F;
             }
-            QLineEdit:focus, QTextEdit:focus, QComboBox:focus { border: 1px solid #00D100; }
+            QTextEdit { padding: 8px 10px; }
+            QLineEdit:focus, QTextEdit:focus, QComboBox:focus { border: 1px solid #7C9CFF; background-color: #111C33; }
             QComboBox::drop-down { border: none; }
-            QComboBox QAbstractItemView { background-color: #252526; color: #FFFFFF; selection-background-color: #3E3E42; border-radius: 5px; }
+            QComboBox QAbstractItemView { background-color: #111827; color: #F8FAFC; selection-background-color: #243B63; border-radius: 5px; }
             
-            QTabWidget::pane { border: 1px solid #3E3E42; border-radius: 6px; background-color: #252526; margin-top: -1px; }
+            QTabWidget::pane { border: 1px solid #26324A; border-radius: 10px; background-color: #0E1628; margin-top: -1px; top: -1px; }
             QTabBar::tab { 
-                background: #1E1E1E; border: 1px solid #3E3E42; border-bottom-color: #3E3E42;
-                border-top-left-radius: 6px; border-top-right-radius: 6px;
-                padding: 10px 20px; margin-right: 2px; color: #A0A0A0; 
+                background: #111827; border: 1px solid #26324A;
+                border-top-left-radius: 8px; border-top-right-radius: 8px;
+                padding: 10px 18px; margin-right: 4px; color: #9FB2D8; 
+                min-width: 96px;
             }
-            QTabBar::tab:selected { background: #252526; border-bottom-color: #252526; color: #00D100; font-weight: bold; }
-            QTabBar::tab:hover:!selected { background: #2D2D30; }
+            QTabBar::tab:selected { background: #18243A; border-color: #4F8CFF; color: #F7FAFF; font-weight: 700; }
+            QTabBar::tab:hover:!selected { background: #172033; color: #DCE7FF; }
             
-            QProgressBar { border: 1px solid #3E3E42; border-radius: 6px; background-color: #252526; text-align: center; color: #FFFFFF; font-weight: bold; height: 25px; }
-            QProgressBar::chunk { background-color: #00D100; border-radius: 5px; }
+            QProgressBar { border: 1px solid #2B3A55; border-radius: 8px; background-color: #0F172A; text-align: center; color: #F8FAFC; font-weight: 700; height: 26px; }
+            QProgressBar::chunk { background-color: #6D8DFF; border-radius: 6px; }
             
-            QCheckBox { color: #D4D4D4; spacing: 8px; padding: 4px; }
-            QCheckBox::indicator { width: 18px; height: 18px; border: 1px solid #3E3E42; border-radius: 4px; background: #1E1E1E; }
-            QCheckBox::indicator:hover { border: 1px solid #00D100; }
-            QCheckBox::indicator:checked { background: #00D100; border: 1px solid #00D100; }
+            QCheckBox { color: #E2E8F0; spacing: 9px; padding: 4px 2px; background: transparent; }
+            QCheckBox:hover { background: transparent; }
+            QGroupBox QCheckBox { min-height: 22px; }
+            QCheckBox::indicator { width: 18px; height: 18px; border: 1px solid #334155; border-radius: 5px; background: #0F172A; }
+            QCheckBox::indicator:hover { border: 1px solid #7C9CFF; }
+            QCheckBox::indicator:checked { background: #6D8DFF; border: 1px solid #8EA5FF; }
             
-            QScrollArea { border: 1px solid #3E3E42; border-radius: 6px; background-color: #252526; }
-            QScrollBar:vertical { border: none; background: #1E1E1E; width: 12px; margin: 0px; }
-            QScrollBar::handle:vertical { background: #3E3E42; min-height: 20px; border-radius: 6px; }
-            QScrollBar::handle:vertical:hover { background: #555555; }
+            QScrollArea { border: 1px solid #26324A; border-radius: 10px; background-color: #0E1628; }
+            QTableWidget {
+                background-color: #0E1628;
+                border: 1px solid #26324A;
+                border-radius: 8px;
+                gridline-color: #26324A;
+            }
+            QHeaderView::section {
+                background-color: #13213A;
+                color: #C7D2FE;
+                border: 1px solid #26324A;
+                padding: 6px;
+                font-weight: 600;
+            }
+            QTextEdit#log_area {
+                background-color: #08111F;
+                border: 1px solid #26324A;
+                border-radius: 10px;
+                color: #DCE7FF;
+                padding: 10px;
+            }
+            QScrollBar:vertical { border: none; background: #0B1020; width: 12px; margin: 0px; }
+            QScrollBar::handle:vertical { background: #334155; min-height: 20px; border-radius: 6px; }
+            QScrollBar::handle:vertical:hover { background: #475569; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+
+            QFrame#variant_card {
+                border: 1px solid #26324A;
+                border-radius: 10px;
+                background-color: #111827;
+            }
+            QFrame#variant_card[has_path="true"] {
+                border-color: #4F8CFF;
+                background-color: #13213A;
+            }
+
+            QFrame#drop_zone {
+                border: 1px dashed #4F8CFF;
+                border-radius: 10px;
+                background-color: #0F172A;
+            }
+            QFrame#drop_zone:hover {
+                background-color: #13213A;
+                border-color: #8EA5FF;
+            }
+
+            QSplitter::handle {
+                background-color: #1E293B;
+                width: 8px;
+                border-radius: 4px;
+                margin: 4px 2px;
+            }
+            QSplitter::handle:hover { background-color: #4F8CFF; }
         """)
 
     def _load_prompt_profiles(self):
@@ -2371,13 +3532,26 @@ class MainWindow(QWidget):
             self._log("Ошибка: Заполните все настройки API для Pull from Apple.")
             return
 
-        locale = self.meta_locale_combo.currentData() or "en-US"
         self.btn_pull_metadata.setEnabled(False)
-        self.metadata_fetcher = FetchCurrentMetadataWorker(api_creds, locale)
+        self.meta_source_locale_label.setText("Локаль: загрузка...")
+        self.meta_source_version_label.setText("Версия: загрузка...")
+        self.metadata_fetcher = FetchMetadataSourceWorker(api_creds)
         self.metadata_fetcher.log_msg.connect(self._log)
-        self.metadata_fetcher.metadata_fetched.connect(self._apply_pulled_metadata)
+        self.metadata_fetcher.source_fetched.connect(self._apply_metadata_source_payload)
         self.metadata_fetcher.finished.connect(lambda: self.btn_pull_metadata.setEnabled(True))
         self.metadata_fetcher.start()
+
+    def _apply_metadata_source_payload(self, metadata_config):
+        locale = metadata_config.get("source_locale")
+        version_info = metadata_config.get("version_info", {})
+        if locale:
+            self._set_metadata_locale(locale)
+            locale_name = LOCALE_MAP.get(locale, ("", locale))[1]
+            self.meta_source_locale_label.setText(f"Локаль: {locale_name} ({locale})")
+        version_text = version_info.get("version_string") or "—"
+        state = version_info.get("state") or "unknown"
+        self.meta_source_version_label.setText(f"Версия: {version_text} · {state}")
+        self._apply_pulled_metadata(metadata_config)
 
     def _apply_pulled_metadata(self, metadata_config):
         if not metadata_config:
@@ -2385,23 +3559,391 @@ class MainWindow(QWidget):
             return
         self._apply_metadata_config_to_gui(metadata_config)
 
-    def _fetch_primary_locale(self):
+    def _set_translation_buttons_enabled(self, enabled):
+        for btn in [
+            getattr(self, "btn_translation_auto_source", None),
+            getattr(self, "btn_translation_translate", None),
+            getattr(self, "btn_translation_validate", None),
+            getattr(self, "btn_translation_upload", None),
+        ]:
+            if btn is not None:
+                btn.setEnabled(enabled)
+
+    def _fetch_translation_source_auto(self):
         self._save_env_to_file()
         api_creds = self._metadata_api_creds()
         if not all(api_creds.values()):
-            self._log("Ошибка: Заполните все настройки API для получения primary locale.")
+            self._log("Ошибка: Заполните Issuer ID, Key ID, APP_ID и .p8 для auto source.")
+            return
+        self.btn_translation_auto_source.setEnabled(False)
+        self.translation_source_info.setText("Определяю primary locale и загружаю source metadata...")
+        self.translation_auto_source_fetcher = FetchTranslationAutoSourceWorker(api_creds)
+        self.translation_auto_source_fetcher.log_msg.connect(self._log)
+        self.translation_auto_source_fetcher.source_fetched.connect(self._apply_translation_auto_source_payload)
+        self.translation_auto_source_fetcher.finished.connect(
+            lambda: self.btn_translation_auto_source.setEnabled(True)
+        )
+        self.translation_auto_source_fetcher.start()
+
+    def _apply_translation_primary_locale(self, locale):
+        idx = self.translation_source_locale_combo.findData(locale)
+        if idx < 0:
+            self.translation_source_locale_combo.addItem(locale, locale)
+            idx = self.translation_source_locale_combo.findData(locale)
+        if idx >= 0:
+            self.translation_source_locale_combo.setCurrentIndex(idx)
+        self._log(f"Primary locale для перевода выбрана: {locale}")
+
+    def _apply_translation_auto_source_payload(self, payload):
+        locale = payload.get("primary_locale") or payload.get("source", {}).get("locale")
+        if locale:
+            self._apply_translation_primary_locale(locale)
+        self._apply_translation_source_payload(payload)
+
+    def _apply_translation_source_payload(self, payload):
+        self.translation_source_payload = payload.get("source", {})
+        self.translation_version_id = payload.get("version_id", "")
+        self.translation_app_info_id = payload.get("app_info_id", "")
+        non_empty = sum(
+            1 for field_key, _, _, _ in TRANSLATION_FIELDS
+            if self.translation_source_payload.get(field_key)
+        )
+        self.translation_source_info.setText(
+            f"Source locale: {self.translation_source_payload.get('locale', '—')} | "
+            f"непустых полей: {non_empty}/{len(TRANSLATION_FIELDS)}"
+        )
+
+    def _selected_translation_fields(self):
+        return [
+            field_key for field_key, checkbox in self.translation_field_checks.items()
+            if checkbox.isChecked()
+        ]
+
+    def _field_label(self, field_key):
+        for key, label, _limit, _target in TRANSLATION_FIELDS:
+            if key == field_key:
+                return label
+        return field_key
+
+    def _field_limit(self, field_key):
+        for key, _label, limit, _target in TRANSLATION_FIELDS:
+            if key == field_key:
+                return limit
+        return None
+
+    def _translate_localizations(self):
+        self._save_env_to_file()
+        if not self.translation_source_payload:
+            self._log("Сначала нажмите Pull source from Apple.")
+            return
+        target_locales = self.translation_target_picker.get_selected_locales()
+        if not target_locales:
+            self._log("Ошибка: выберите хотя бы одну целевую локаль для перевода.")
+            return
+        fields = self._selected_translation_fields()
+        if not fields:
+            self._log("Ошибка: выберите хотя бы одно поле для перевода.")
+            return
+        api_key = self.gemini_key_input.text().strip()
+        model = self.gemini_model_input.text().strip() or "gemini-2.5-flash"
+        if not api_key:
+            self._log("Ошибка: укажите Gemini API key в верхнем блоке настроек API.")
             return
 
-        self.btn_fetch_primary_locale.setEnabled(False)
-        self.primary_locale_fetcher = FetchPrimaryLocaleWorker(api_creds)
-        self.primary_locale_fetcher.log_msg.connect(self._log)
-        self.primary_locale_fetcher.primary_locale_fetched.connect(self._apply_primary_locale)
-        self.primary_locale_fetcher.finished.connect(lambda: self.btn_fetch_primary_locale.setEnabled(True))
-        self.primary_locale_fetcher.start()
+        source_locale = self.translation_source_locale_combo.currentData() or "en-US"
+        profile = self.translation_profile_combo.currentText().strip() or "ASO natural"
+        self._set_translation_buttons_enabled(False)
+        self.translation_worker = GeminiLocalizationTranslationWorker(
+            api_key=api_key,
+            model=model,
+            source_locale=source_locale,
+            target_locales=target_locales,
+            fields=fields,
+            profile_name=profile,
+            source_payload=self.translation_source_payload,
+        )
+        self.translation_worker.log_msg.connect(self._log)
+        self.translation_worker.translations_ready.connect(self._populate_translation_table)
+        self.translation_worker.finished.connect(lambda: self._set_translation_buttons_enabled(True))
+        self.translation_worker.start()
 
-    def _apply_primary_locale(self, locale):
-        self._set_metadata_locale(locale)
-        self._log(f"Primary locale выбрана в форме: {locale}")
+    def _populate_translation_table(self, rows):
+        self.translation_table_busy = True
+        self.translation_table.setRowCount(0)
+        for row_data in rows:
+            row_idx = self.translation_table.rowCount()
+            self.translation_table.insertRow(row_idx)
+            values = [
+                row_data.get("locale", ""),
+                self._field_label(row_data.get("field", "")),
+                row_data.get("source", ""),
+                row_data.get("translation", ""),
+                row_data.get("status", ""),
+                row_data.get("warning", ""),
+            ]
+            for col_idx, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if col_idx != 3:
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if col_idx == 1:
+                    item.setData(Qt.UserRole, row_data.get("field", ""))
+                self.translation_table.setItem(row_idx, col_idx, item)
+        self.translation_table_busy = False
+        self._validate_translation_table()
+
+    def _status_for_row(self, field_key, translation_text):
+        text = str(translation_text or "").strip()
+        if not text:
+            return "warn", "Пустой перевод"
+        limit = self._field_limit(field_key)
+        if limit and len(text) > limit:
+            return "error", f"Превышен лимит {len(text)}/{limit}"
+        if field_key == "keywords":
+            if " " in text:
+                return "info", "Keywords: лучше без пробелов"
+            items = [v.strip().lower() for v in text.split(",") if v.strip()]
+            duplicates = sorted({v for v in items if items.count(v) > 1})
+            if duplicates:
+                return "info", f"Дубли keywords: {', '.join(duplicates)}"
+            generic = {"best", "top", "easy", "fast", "free", "app", "simple"}
+            generic_hits = sorted(generic.intersection(items))
+            if generic_hits:
+                return "info", f"Generic keywords: {', '.join(generic_hits)}"
+        lowered = text.lower()
+        banned_hits = [word for word in BANNED_ASO_WORDS if word in lowered]
+        if banned_hits:
+            return "info", f"ASO warning: banned words ({', '.join(banned_hits[:3])})"
+        return "ok", "Готово"
+
+    def _apply_row_status_style(self, row_idx, status, warning):
+        color = TRANSLATION_STATUS_COLORS.get(status, QColor("#1E293B"))
+        status_text = {
+            "ok": "готово",
+            "warn": "пусто",
+            "error": "ошибка",
+            "info": "рекомендация",
+        }.get(status, status)
+        status_item = self.translation_table.item(row_idx, 4)
+        warning_item = self.translation_table.item(row_idx, 5)
+        if status_item is not None:
+            status_item.setText(status_text)
+        if warning_item is not None:
+            warning_item.setText(warning)
+        for col_idx in range(self.translation_table.columnCount()):
+            item = self.translation_table.item(row_idx, col_idx)
+            if item is not None:
+                item.setBackground(color)
+
+    def _validate_translation_table(self):
+        self.translation_table_busy = True
+        for row_idx in range(self.translation_table.rowCount()):
+            field_item = self.translation_table.item(row_idx, 1)
+            translation_item = self.translation_table.item(row_idx, 3)
+            if field_item is None or translation_item is None:
+                continue
+            field_key = field_item.data(Qt.UserRole) or field_item.text().strip()
+            status, warning = self._status_for_row(field_key, translation_item.text())
+            self._apply_row_status_style(row_idx, status, warning)
+        self.translation_table_busy = False
+        self._log("Validate завершен для таблицы переводов.")
+
+    def _on_translation_item_changed(self, item):
+        if self.translation_table_busy or item.column() != 3:
+            return
+        row_idx = item.row()
+        field_item = self.translation_table.item(row_idx, 1)
+        if field_item is None:
+            return
+        field_key = field_item.data(Qt.UserRole) or field_item.text().strip()
+        status, warning = self._status_for_row(field_key, item.text())
+        self._apply_row_status_style(row_idx, status, warning)
+
+    def _collect_translation_rows(self):
+        rows = []
+        for row_idx in range(self.translation_table.rowCount()):
+            locale_item = self.translation_table.item(row_idx, 0)
+            field_item = self.translation_table.item(row_idx, 1)
+            source_item = self.translation_table.item(row_idx, 2)
+            translation_item = self.translation_table.item(row_idx, 3)
+            status_item = self.translation_table.item(row_idx, 4)
+            warning_item = self.translation_table.item(row_idx, 5)
+            if not all([locale_item, field_item, source_item, translation_item, status_item, warning_item]):
+                continue
+            rows.append({
+                "locale": locale_item.text().strip(),
+                "field": field_item.data(Qt.UserRole) or field_item.text().strip(),
+                "source": source_item.text(),
+                "translation": translation_item.text(),
+                "status": {
+                    "готово": "ok",
+                    "пусто": "warn",
+                    "ошибка": "error",
+                    "рекомендация": "info",
+                }.get(status_item.text().strip(), "warn"),
+                "warning": warning_item.text().strip(),
+            })
+        return rows
+
+    def _upload_translation_rows(self):
+        rows = self._collect_translation_rows()
+        if not rows:
+            self._log("Нет данных для загрузки. Сначала выполните перевод.")
+            return
+        ready_rows = [row for row in rows if row.get("status") == "ok"]
+        if not ready_rows:
+            self._log("Нет строк со статусом «готово». Исправьте ошибки и повторите validate.")
+            return
+        self._set_translation_buttons_enabled(False)
+        self.translation_upload_worker = LocalizationUploadWorker(self._metadata_api_creds(), rows)
+        self.translation_upload_worker.log_msg.connect(self._log)
+        self.translation_upload_worker.progress_update.connect(self._update_progress)
+        self.translation_upload_worker.upload_finished.connect(self._on_translation_upload_finished)
+        self.translation_upload_worker.finished.connect(lambda: self._set_translation_buttons_enabled(True))
+        self.translation_upload_worker.start()
+
+    def _on_translation_upload_finished(self, summary):
+        self._log(
+            "Upload переводов завершен: "
+            f"локалей={summary.get('locales', 0)}, "
+            f"полей={summary.get('fields', 0)}, "
+            f"ошибок={summary.get('errors', 0)}"
+        )
+
+    def _fetch_app_version(self, silent=False):
+        self._save_env_to_file()
+        api_creds = self._metadata_api_creds()
+        if not all(api_creds.values()):
+            if not silent:
+                self._log("Ошибка: Заполните Issuer ID, Key ID, APP_ID и .p8 для загрузки версии.")
+            return
+
+        if hasattr(self, "btn_fetch_app_version"):
+            self.btn_fetch_app_version.setEnabled(False)
+        self.app_version_fetcher = FetchAppVersionWorker(api_creds)
+        self.app_version_fetcher.log_msg.connect(self._log)
+        self.app_version_fetcher.version_fetched.connect(self._apply_app_version)
+        self.app_version_fetcher.finished.connect(
+            lambda: self.btn_fetch_app_version.setEnabled(True) if hasattr(self, "btn_fetch_app_version") else None
+        )
+        self.app_version_fetcher.start()
+
+    def _apply_app_version(self, version_info):
+        version_string = version_info.get("version_string") or "—"
+        state = version_info.get("state") or "unknown"
+        version_id = version_info.get("id") or ""
+        label = f"{version_string} · {state}"
+        if version_id:
+            label += f" · {version_id}"
+        self.meta_app_version_input.setText(label)
+
+    def _app_lookup_creds(self):
+        self._autofill_key_id_from_p8_path()
+        return {
+            "issuer": self.issuer_input.text().strip(),
+            "key_id": self.key_input.text().strip(),
+            "p8_path": self.p8_path_input.text().strip(),
+        }
+
+    def _fetch_app_ids(self):
+        creds = self._app_lookup_creds()
+        missing = [name for name, value in creds.items() if not value]
+        if missing:
+            self._log(
+                "Ошибка: для загрузки App ID нужны Issuer ID, Key ID и путь к .p8. "
+                f"Не заполнено: {', '.join(missing)}"
+            )
+            return
+
+        self.btn_fetch_app_id.setEnabled(False)
+        self._log("Запрашиваю список приложений App Store Connect...")
+        self.apps_fetcher = FetchAppsWorker(creds)
+        self.apps_fetcher.log_msg.connect(self._log)
+        self.apps_fetcher.apps_fetched.connect(self._apply_fetched_apps)
+        self.apps_fetcher.finished.connect(lambda: self.btn_fetch_app_id.setEnabled(True))
+        self.apps_fetcher.start()
+
+    def _apply_fetched_apps(self, apps):
+        if not apps:
+            self._log("В App Store Connect не найдено доступных приложений для этого ключа.")
+            return
+        if len(apps) == 1:
+            self._set_selected_app(apps[0])
+            return
+        selected_app = self._select_app_dialog(apps)
+        if selected_app:
+            self._set_selected_app(selected_app)
+
+    def _select_app_dialog(self, apps):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Выберите приложение")
+        dialog.resize(720, 520)
+        layout = QVBoxLayout(dialog)
+        hint = QLabel("Выберите приложение, для которого нужно подставить APP_ID.")
+        hint.setProperty("role", "hint")
+        layout.addWidget(hint)
+
+        search_input = QLineEdit()
+        search_input.setPlaceholderText("Поиск по названию, bundle id, sku или app id")
+        layout.addWidget(search_input)
+
+        list_widget = QListWidget(dialog)
+        layout.addWidget(list_widget, stretch=1)
+
+        def app_label(app):
+            name = app.get("name") or "Без названия"
+            bundle_id = app.get("bundle_id") or "no bundle"
+            sku = app.get("sku") or "no sku"
+            app_id = app.get("id") or "no id"
+            locale = app.get("primary_locale") or "no locale"
+            return f"{name} | {bundle_id} | SKU: {sku} | APP_ID: {app_id} | {locale}"
+
+        def populate(query=""):
+            list_widget.clear()
+            normalized = query.strip().lower()
+            for app in apps:
+                label = app_label(app)
+                if normalized and normalized not in label.lower():
+                    continue
+                item = QListWidgetItem(label, list_widget)
+                item.setData(Qt.UserRole, app)
+
+        populate()
+        search_input.textChanged.connect(populate)
+
+        buttons_row = QHBoxLayout()
+        btn_cancel = QPushButton("Отмена")
+        btn_ok = QPushButton("Выбрать")
+        btn_ok.setObjectName("start_btn")
+        buttons_row.addStretch(1)
+        buttons_row.addWidget(btn_cancel)
+        buttons_row.addWidget(btn_ok)
+        layout.addLayout(buttons_row)
+
+        btn_cancel.clicked.connect(dialog.reject)
+        btn_ok.clicked.connect(dialog.accept)
+        list_widget.itemDoubleClicked.connect(lambda *_args: dialog.accept())
+
+        if list_widget.count() > 0:
+            list_widget.setCurrentRow(0)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        current_item = list_widget.currentItem()
+        if current_item is None:
+            QMessageBox.warning(self, "App ID", "Выберите приложение из списка.")
+            return None
+        return current_item.data(Qt.UserRole)
+
+    def _set_selected_app(self, app):
+        app_id = app.get("id", "").strip()
+        if not app_id:
+            self._log("Ошибка: выбранное приложение не содержит APP_ID.")
+            return
+        self.app_input.setText(app_id)
+        name = app.get("name") or "приложение"
+        bundle_id = app.get("bundle_id") or "bundle id не указан"
+        self._save_env_to_file()
+        self._log(f"APP_ID выбран: {app_id} ({name}, {bundle_id})")
+        self._fetch_app_version(silent=True)
 
     def _load_metadata_json(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Выберите JSON с метаданными", "", "JSON Files (*.json);;All Files (*)")
@@ -2716,10 +4258,6 @@ class MainWindow(QWidget):
         self._log("Payload preview:")
         self._log(json.dumps(metadata_config, ensure_ascii=False, indent=2))
 
-    def _toggle_locales(self, state):
-        for cb in self.locale_checkboxes:
-            cb.setChecked(state)
-
     def _on_availability_mode_changed(self):
         is_selected_mode = (self.meta_availability_mode_input.currentData() == "SELECTED")
         self.meta_select_territories_btn.setVisible(is_selected_mode)
@@ -2789,36 +4327,34 @@ class MainWindow(QWidget):
             self.meta_selected_territories = selected
             self.meta_select_territories_btn.setText(f"Выбрано стран: {len(selected)}")
 
-    def _set_screenshot_controls_visible(self, visible):
-        for control in self.screenshot_controls:
-            control.setVisible(visible)
-
     def _on_tab_change(self, index):
-        self._set_screenshot_controls_visible(index in (0, 1))
         if index == 0:
+            self.start_btn.setVisible(True)
             self.start_btn.setText("🚀 СОЗДАТЬ НОВЫЙ ТЕСТ")
         elif index == 1:
+            self.start_btn.setVisible(True)
             self.start_btn.setText("🚀 ОБНОВИТЬ ВЫБРАННЫЕ ДАННЫЕ В ТЕСТЕ")
         elif index == 2:
+            self.start_btn.setVisible(True)
             self.start_btn.setText("🚀 ЗАГРУЗИТЬ МЕТАДАННЫЕ ПРИЛОЖЕНИЯ")
-        elif index == 3:
-            self.start_btn.setText("⬆️ ЗАГРУЗКА СКРИНОВ: используйте кнопку в табе")
-        elif index == 4:
-            self.start_btn.setText("🔐 ЗАГРУЗИТЬ APP PRIVACY")
-            self._preview_app_privacy()
+        elif index in (3, 4):
+            self.start_btn.setVisible(False)
         else:
+            self.start_btn.setVisible(True)
             self.start_btn.setText("🚀 ЗАПУСТИТЬ ПРОЦЕСС")
 
     def _autofill_key_id_from_p8_path(self):
-        filename = os.path.basename(self.p8_path_input.text().strip())
-        if not filename:
+        key_id = self._extract_key_id_from_p8_path()
+        if not key_id:
             return
-        if filename.startswith("AuthKey_") and filename.lower().endswith(".p8"):
-            key_id = filename[len("AuthKey_"):-3]
-            if key_id and not self.key_input.text().strip():
-                self.key_input.setText(key_id)
-                self._log(f"KEY_ID автоматически определен из имени .p8: {key_id}")
-            self._log("Issuer ID нельзя извлечь из .p8 файла — Apple хранит его отдельно в App Store Connect.")
+        if self.key_input.text().strip() != key_id:
+            self.key_input.setText(key_id)
+            self._log(f"KEY_ID автоматически определен из имени .p8: {key_id}")
+        self._log(
+            "APP_ID нельзя извлечь из .p8: Apple private key содержит только ключ подписи. "
+            "APP_ID нужно указать из App Store Connect."
+        )
+        self._save_env_to_file()
 
     def _select_p8_file(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Выберите файл", "", "Key Files (*.p8);;All Files (*)")
@@ -2826,11 +4362,13 @@ class MainWindow(QWidget):
             self.p8_path_input.setText(file_path)
             self._autofill_key_id_from_p8_path()
 
-    def _select_folder(self, variant, button):
+    def _select_folder(self, variant, button=None):
         folder = QFileDialog.getExistingDirectory(self, f"Выберите папку для {variant}")
         if folder:
             self.variants_paths[variant] = folder
-            button.setText(f"{variant}: {os.path.basename(folder)}")
+            if button is not None:
+                button.setText(f"{variant}: {os.path.basename(folder)}")
+            self._refresh_variant_cards()
 
     def _log(self, text):
         self.log_area.append(text)
@@ -3092,9 +4630,8 @@ class MainWindow(QWidget):
         self.locale_refresh_worker.start()
 
     def _apply_active_screenshot_locales(self, active_locales):
-        active = set(active_locales)
-        for cb in self.upload_locale_checkboxes:
-            cb.setChecked(cb.property("locale_code") in active)
+        self.upload_locale_picker.set_available_locales(active_locales)
+        self._update_upload_summary()
 
     def _ensure_tinypng_key_visible(self):
         key = resolve_tinypng_api_key()
@@ -3109,7 +4646,7 @@ class MainWindow(QWidget):
         return resolve_tinypng_api_key()
 
     def _validate_screenshot_upload_prereqs(self):
-        target_locales = [cb.property("locale_code") for cb in self.upload_locale_checkboxes if cb.isChecked()]
+        target_locales = self.upload_locale_picker.get_selected_locales()
         if not target_locales:
             self._log("Ошибка: Выберите хотя бы одну локаль на вкладке «ЗАГРУЗКА СКРИНОВ».")
             return False
@@ -3134,8 +4671,43 @@ class MainWindow(QWidget):
     def _select_jpeg_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Выберите .jpeg файлы", "", "JPEG Files (*.jpeg *.jpg)")
         if files:
-            self.upload_jpeg_files = sorted([f for f in files if f.lower().endswith((".jpeg", ".jpg"))])
-            self.lbl_selected_jpegs.setText(f"Выбрано файлов: {len(self.upload_jpeg_files)}")
+            self._set_upload_jpeg_files(files)
+
+    def _set_upload_jpeg_files(self, files):
+        self.upload_jpeg_files = sorted([
+            f for f in files
+            if f and f.lower().endswith((".jpeg", ".jpg"))
+        ])
+        self.lbl_selected_jpegs.setText(f"Выбрано файлов: {len(self.upload_jpeg_files)}")
+        self.upload_files_preview.clear()
+        for index, file_path in enumerate(self.upload_jpeg_files[:12], start=1):
+            self.upload_files_preview.addItem(f"{index}. {os.path.basename(file_path)}")
+        if len(self.upload_jpeg_files) > 12:
+            self.upload_files_preview.addItem(f"...и еще {len(self.upload_jpeg_files) - 12} файлов")
+        self._update_upload_files_warning()
+        self._update_upload_summary()
+
+    def _update_upload_files_warning(self):
+        if not self.upload_jpeg_files:
+            self.upload_files_warning.setText("Выберите или перетащите .jpg/.jpeg файлы для загрузки.")
+            return
+        basenames = [os.path.basename(path) for path in self.upload_jpeg_files]
+        numbered = all(re.match(r"^\d+", name) for name in basenames)
+        if len(self.upload_jpeg_files) > 1 and not numbered:
+            self.upload_files_warning.setText(
+                "Проверьте порядок файлов: имена не начинаются с номера, сортировка будет по имени."
+            )
+        else:
+            self.upload_files_warning.setText("Порядок файлов будет по имени после сортировки.")
+
+    def _update_upload_summary(self):
+        if not hasattr(self, "upload_summary_label"):
+            return
+        locale_count = len(self.upload_locale_picker.get_selected_locales()) if hasattr(self, "upload_locale_picker") else 0
+        file_count = len(getattr(self, "upload_jpeg_files", []))
+        self.upload_summary_label.setText(
+            f"Локалей: {locale_count} · Файлов: {file_count} · Всего upload задач: {locale_count * file_count}"
+        )
 
     def _start_screenshot_upload(self):
         self._save_env_to_file()
@@ -3148,7 +4720,7 @@ class MainWindow(QWidget):
         if not all(api_creds.values()):
             self._log("Ошибка: Заполните все поля в разделе НАСТРОЙКИ API.")
             return
-        target_locales = [cb.property("locale_code") for cb in self.upload_locale_checkboxes if cb.isChecked()]
+        target_locales = self.upload_locale_picker.get_selected_locales()
         if not target_locales:
             self._log("Ошибка: Выберите хотя бы одну локаль для загрузки скринов.")
             return
@@ -3199,7 +4771,7 @@ class MainWindow(QWidget):
             if self.chk_var_b.isChecked(): target_variants.append(self.chk_var_b.property("variant_id"))
             if self.chk_var_c.isChecked(): target_variants.append(self.chk_var_c.property("variant_id"))
             
-            target_locales = [cb.property("locale_code") for cb in self.locale_checkboxes if cb.isChecked()]
+            target_locales = self.update_locale_picker.get_selected_locales()
             
             if not test_name:
                 self._log("Ошибка: Не выбран тест. Нажмите 'Загрузить список'.")
@@ -3237,8 +4809,8 @@ class MainWindow(QWidget):
             self.worker.finished_ok.connect(self._on_metadata_upload_finished)
             self.worker.start()
             return
-        elif current_tab_index == 4:
-            self._upload_app_privacy()
+        elif current_tab_index in (3, 4):
+            self._log("Для этой вкладки используйте кнопки внутри вкладки.")
             return
 
         tinypng_api_key = self._tinypng_api_key()
