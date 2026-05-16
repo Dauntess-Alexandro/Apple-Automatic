@@ -12,7 +12,8 @@ from dotenv import load_dotenv
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QLineEdit, QPushButton, QTextEdit, QFileDialog, QLabel, QGroupBox,
-    QProgressBar, QTabWidget, QCheckBox, QScrollArea, QComboBox, QToolButton
+    QProgressBar, QTabWidget, QCheckBox, QScrollArea, QComboBox, QToolButton,
+    QDialog, QListWidget, QListWidgetItem, QMessageBox
 )
 from PySide6.QtGui import QIcon
 from PySide6.QtCore import QThread, Signal, Qt, QSize
@@ -91,7 +92,7 @@ def prepare_app_review_detail_attributes(source, existing=None):
     existing = existing or {}
     allowed = {
         "contactFirstName", "contactLastName", "contactPhone", "contactEmail",
-        "demoAccountName", "demoAccountPassword", "demoAccountRequired", "notes"
+        "notes"
     }
     merged = {}
     for field in allowed:
@@ -99,15 +100,9 @@ def prepare_app_review_detail_attributes(source, existing=None):
             merged[field] = source[field]
         elif field in existing and existing[field] not in (None, ""):
             merged[field] = existing[field]
-    if "demoAccountRequired" in source:
-        merged["demoAccountRequired"] = bool(source["demoAccountRequired"])
     if merged.get("contactPhone"):
         merged["contactPhone"] = normalize_review_phone(merged["contactPhone"])
     missing = [field for field in REQUIRED_APP_REVIEW_FIELDS if not merged.get(field)]
-    if merged.get("demoAccountRequired") and (
-        not merged.get("demoAccountName") or not merged.get("demoAccountPassword")
-    ):
-        missing.append("demoAccountName/demoAccountPassword (нужны при demo account)")
     return merged, missing
 
 
@@ -672,6 +667,20 @@ class ASCClient:
     def run_custom_request(self, method, endpoint, payload=None):
         return self._request(method.upper(), endpoint.lstrip("/"), payload)
 
+    def get_all_territory_ids(self):
+        endpoint = "territories?limit=200"
+        data = self._request("GET", endpoint)
+        territory_ids = [item.get("id") for item in data.get("data", []) if item.get("id")]
+        if not territory_ids:
+            raise Exception("Не удалось получить список территорий из App Store Connect.")
+        return territory_ids
+
+    def set_app_available_territories(self, territory_ids):
+        payload = {
+            "data": [{"type": "territories", "id": territory_id} for territory_id in territory_ids]
+        }
+        self._request("PATCH", f"apps/{self.app_id}/relationships/availableTerritories", payload)
+
     def get_app_data_usages(self):
         endpoint = f"apps/{self.app_id}/dataUsages?include=category,purpose,dataProtection&limit=200"
         data = self._request("GET", endpoint)
@@ -913,7 +922,7 @@ class MetadataWorker(QThread):
     APP_STORE_VERSION_FIELDS = {"copyright"}
     APP_REVIEW_DETAIL_FIELDS = {
         "contactFirstName", "contactLastName", "contactPhone", "contactEmail",
-        "demoAccountName", "demoAccountPassword", "demoAccountRequired", "notes"
+        "notes"
     }
 
     def __init__(self, api_creds, metadata_config):
@@ -959,6 +968,8 @@ class MetadataWorker(QThread):
                 (1 if self.metadata_config.get("app_info") else 0) +
                 (1 if self.metadata_config.get("app_store_version") else 0) +
                 (1 if self.metadata_config.get("app_review_detail") else 0) +
+                (1 if self.metadata_config.get("availability_mode") else 0) +
+                (1 if "collects_data" in self.metadata_config else 0) +
                 len(self.metadata_config.get("custom_requests", []))
             )
             if total_tasks == 0:
@@ -1133,11 +1144,35 @@ class MetadataWorker(QThread):
                 else:
                     if existing_detail:
                         client.update_app_review_detail(existing_detail["id"], attributes)
-                        self.log_msg.emit("✅ Обновлены App Review notes/contact/demo account.")
+                        self.log_msg.emit("✅ Обновлены App Review notes/contact.")
                     else:
                         client.create_app_review_detail(version_id, attributes)
-                        self.log_msg.emit("✅ Созданы App Review notes/contact/demo account.")
+                        self.log_msg.emit("✅ Созданы App Review notes/contact.")
                     tick("Готово App Review")
+
+            availability_mode = self.metadata_config.get("availability_mode")
+            if availability_mode:
+                all_territory_ids = client.get_all_territory_ids()
+                if availability_mode == "SELECTED":
+                    selected_territory_ids = set(self.metadata_config.get("availability_territories", []))
+                    filtered_ids = [tid for tid in all_territory_ids if tid in selected_territory_ids]
+                    if not filtered_ids:
+                        raise Exception("Availability mode SELECTED: не выбрана ни одна страна.")
+                    client.set_app_available_territories(filtered_ids)
+                    self.log_msg.emit(f"✅ Availability обновлен: выбрано стран {len(filtered_ids)}.")
+                else:
+                    client.set_app_available_territories(all_territory_ids)
+                    self.log_msg.emit("✅ Availability обновлен: все страны (дефолт).")
+                tick("Готово availability")
+
+            if "collects_data" in self.metadata_config:
+                collects_data = bool(self.metadata_config.get("collects_data"))
+                if not collects_data:
+                    client.sync_app_privacy_details([], publish=True)
+                    self.log_msg.emit("✅ App Privacy: установлено «не собираем данные».")
+                else:
+                    self.log_msg.emit("ℹ️ App Privacy: режим «собираем данные», изменения не применялись автоматически.")
+                tick("Готово app privacy")
 
             for request_config in self.metadata_config.get("custom_requests", []):
                 method = request_config.get("method", "PATCH")
@@ -1628,15 +1663,30 @@ class ScreenshotUploadWorker(QThread):
             loc_to_id = {item["attributes"]["locale"]: item["id"] for item in records if item.get("attributes", {}).get("locale")}
             total_steps = max(1, len(self.target_locales) * len(self.jpeg_files))
             done = 0
+            progress_lock = threading.Lock()
+            locales_lock = threading.Lock()
 
-            for locale in self.target_locales:
-                if locale not in loc_to_id:
-                    self.log_msg.emit(f"[{locale}] Локаль не открыта, создаем...")
-                    loc_to_id[locale] = client.create_version_localization(version_id, locale, {})
-                    time.sleep(0.5)
-                localization_id = loc_to_id[locale]
+            def tick():
+                nonlocal done
+                with progress_lock:
+                    done += 1
+                    percent = int((done / total_steps) * 100)
+                    self.progress_update.emit(percent, f"Загрузка: {percent}%")
+
+            def upload_locale(locale):
+                local_client = ASCClient(
+                    self.api_creds["issuer"], self.api_creds["key_id"],
+                    self.api_creds["p8_path"], self.api_creds["app_id"], self.log_msg.emit
+                )
+                with locales_lock:
+                    localization_id = loc_to_id.get(locale)
+                    if not localization_id:
+                        self.log_msg.emit(f"[{locale}] Локаль не открыта, создаем...")
+                        localization_id = local_client.create_version_localization(version_id, locale, {})
+                        loc_to_id[locale] = localization_id
+                        time.sleep(0.5)
                 self.log_msg.emit(f"[{locale}] Подготовка screenshot set APP_IPHONE_67...")
-                sets = client._request("GET", f"appStoreVersionLocalizations/{localization_id}/appScreenshotSets").get("data", [])
+                sets = local_client._request("GET", f"appStoreVersionLocalizations/{localization_id}/appScreenshotSets").get("data", [])
                 target_set = next((s for s in sets if s.get("attributes", {}).get("screenshotDisplayType") == "APP_IPHONE_67"), None)
                 if target_set is None:
                     payload = {
@@ -1650,18 +1700,23 @@ class ScreenshotUploadWorker(QThread):
                             }
                         }
                     }
-                    target_set_id = client._request("POST", "appScreenshotSets", payload)["data"]["id"]
+                    target_set_id = local_client._request("POST", "appScreenshotSets", payload)["data"]["id"]
                 else:
                     target_set_id = target_set["id"]
 
                 for idx, file_path in enumerate(prepared_files, start=1):
                     file_name = f"{idx}_{os.path.basename(self.jpeg_files[idx - 1])}"
                     self.log_msg.emit(f"[{locale}] Upload {idx}/{len(prepared_files)}: {file_name}")
-                    client.upload_screenshot(target_set_id, file_path, file_name)
-                    done += 1
-                    percent = int((done / total_steps) * 100)
-                    self.progress_update.emit(percent, f"Загрузка: {percent}%")
+                    local_client.upload_screenshot(target_set_id, file_path, file_name)
+                    tick()
                     time.sleep(1)
+
+            max_workers = min(5, max(1, len(self.target_locales)))
+            self.log_msg.emit(f"Запускаем параллельную загрузку скринов: потоков {max_workers}.")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(upload_locale, locale) for locale in self.target_locales]
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
 
             self.log_msg.emit("✅ Upload скриншотов завершен.")
         except Exception as e:
@@ -1753,6 +1808,9 @@ class MainWindow(QWidget):
         self.chk_var_a = QCheckBox("Variant A (или Treatment A)")
         self.chk_var_b = QCheckBox("Variant B (или Treatment B)")
         self.chk_var_c = QCheckBox("Variant C (или Treatment C)")
+        self.chk_var_a.setChecked(True)
+        self.chk_var_b.setChecked(True)
+        self.chk_var_c.setChecked(True)
         
         self.chk_var_a.setProperty("variant_id", "Variant A")
         self.chk_var_b.setProperty("variant_id", "Variant B")
@@ -1901,8 +1959,18 @@ class MainWindow(QWidget):
             label = category_name if not category_id else f"{category_name} ({category_id})"
             self.meta_primary_category_input.addItem(label, category_id)
             self.meta_secondary_category_input.addItem(label, category_id)
-        self.meta_kids_age_band_input = QLineEdit()
+        self.meta_kids_age_band_input = QLineEdit("FIVE_AND_UNDER")
         self.meta_kids_age_band_input.setPlaceholderText("По умолчанию 4+ / без ограничений")
+        self.meta_availability_mode_input = QComboBox()
+        self.meta_availability_mode_input.addItem("Все страны (Apple default)", "ALL")
+        self.meta_availability_mode_input.addItem("Страны на выбор", "SELECTED")
+        self.meta_availability_mode_input.currentIndexChanged.connect(self._on_availability_mode_changed)
+        self.meta_collects_data_checkbox = QCheckBox("Собираем данные (App Privacy)")
+        self.meta_collects_data_checkbox.setChecked(False)
+        self.meta_selected_territories = []
+        self.meta_select_territories_btn = QPushButton("Выбрать страны…")
+        self.meta_select_territories_btn.clicked.connect(self._open_territories_selector)
+        self.meta_select_territories_btn.setVisible(False)
         app_info_form.addRow("Name:", self.meta_name_input)
         self._add_metadata_field_row(app_info_form, "Subtitle:", self.meta_subtitle_input, "subtitle")
         app_info_form.addRow("Copyright:", self.meta_copyright_input)
@@ -1911,6 +1979,9 @@ class MainWindow(QWidget):
         self._add_metadata_field_row(app_info_form, "Primary Category:", self.meta_primary_category_input, "category")
         self._add_metadata_field_row(app_info_form, "Secondary Category:", self.meta_secondary_category_input, "category")
         app_info_form.addRow("Age rating default:", self.meta_kids_age_band_input)
+        app_info_form.addRow("App availability:", self.meta_availability_mode_input)
+        app_info_form.addRow("", self.meta_select_territories_btn)
+        app_info_form.addRow("Data collection:", self.meta_collects_data_checkbox)
         metadata_form_layout.addWidget(app_info_group)
 
         review_group = QGroupBox("App Review notes")
@@ -1920,18 +1991,12 @@ class MainWindow(QWidget):
         self.meta_review_phone_input = QLineEdit()
         self.meta_review_phone_input.setPlaceholderText("+1 555 010 0611")
         self.meta_review_email_input = QLineEdit()
-        self.meta_demo_required_checkbox = QCheckBox("Демо-аккаунт нужен")
-        self.meta_demo_user_input = QLineEdit()
-        self.meta_demo_password_input = QLineEdit()
         self.meta_review_notes_input = QTextEdit()
         self.meta_review_notes_input.setFixedHeight(90)
         review_form.addRow("Contact first name:", self.meta_review_first_name_input)
         review_form.addRow("Contact last name:", self.meta_review_last_name_input)
         review_form.addRow("Contact phone:", self.meta_review_phone_input)
         review_form.addRow("Contact email:", self.meta_review_email_input)
-        review_form.addRow("Demo account:", self.meta_demo_required_checkbox)
-        review_form.addRow("Demo login:", self.meta_demo_user_input)
-        review_form.addRow("Demo password:", self.meta_demo_password_input)
         self._add_metadata_field_row(review_form, "Notes:", self.meta_review_notes_input, "review_notes")
         metadata_form_layout.addWidget(review_group)
 
@@ -2025,6 +2090,7 @@ class MainWindow(QWidget):
         self.chain_screenshots_checkbox = QCheckBox(
             "После метаданных: TinyPNG → загрузка скринов (файлы и локали — вкладка «ЗАГРУЗКА СКРИНОВ»)"
         )
+        self.chain_screenshots_checkbox.setChecked(True)
         metadata_form_layout.addWidget(self.chain_screenshots_checkbox)
 
         metadata_scroll.setWidget(metadata_widget)
@@ -2384,14 +2450,22 @@ class MainWindow(QWidget):
         self._set_combo_data(self.meta_primary_category_input, app_info.get("primaryCategory", ""))
         self._set_combo_data(self.meta_secondary_category_input, app_info.get("secondaryCategory", ""))
         self.meta_kids_age_band_input.setText(app_info.get("kidsAgeBand", ""))
+        self._set_combo_data(
+            self.meta_availability_mode_input,
+            metadata_config.get("availability_mode", "ALL")
+        )
+        self.meta_selected_territories = metadata_config.get("availability_territories", [])
+        self.meta_collects_data_checkbox.setChecked(bool(metadata_config.get("collects_data", False)))
+        if self.meta_selected_territories:
+            self.meta_select_territories_btn.setText(f"Выбрано стран: {len(self.meta_selected_territories)}")
+        else:
+            self.meta_select_territories_btn.setText("Выбрать страны…")
+        self._on_availability_mode_changed()
 
         self.meta_review_first_name_input.setText(review.get("contactFirstName", ""))
         self.meta_review_last_name_input.setText(review.get("contactLastName", ""))
         self.meta_review_phone_input.setText(review.get("contactPhone", ""))
         self.meta_review_email_input.setText(review.get("contactEmail", ""))
-        self.meta_demo_required_checkbox.setChecked(bool(review.get("demoAccountRequired", False)))
-        self.meta_demo_user_input.setText(review.get("demoAccountName", ""))
-        self.meta_demo_password_input.setText(review.get("demoAccountPassword", ""))
         self.meta_review_notes_input.setPlainText(review.get("notes", ""))
 
         custom_requests = metadata_config.get("custom_requests", [])
@@ -2421,8 +2495,11 @@ class MainWindow(QWidget):
             "app_info": {
                 "primaryCategory": "6016",
                 "secondaryCategory": "",
-                "kidsAgeBand": ""
+                "kidsAgeBand": "FIVE_AND_UNDER"
             },
+            "availability_mode": "ALL",
+            "availability_territories": [],
+            "collects_data": False,
             "app_store_version": {
                 "copyright": "© Your Developer Name"
             },
@@ -2431,7 +2508,6 @@ class MainWindow(QWidget):
                 "contactLastName": "Appleseed",
                 "contactPhone": "+1 555 0100",
                 "contactEmail": "review@example.com",
-                "demoAccountRequired": False,
                 "notes": "Notes for App Review team"
             },
             "custom_requests": []
@@ -2475,6 +2551,7 @@ class MainWindow(QWidget):
             "secondaryCategory": self._line_text(self.meta_secondary_category_input),
             "kidsAgeBand": self._line_text(self.meta_kids_age_band_input)
         }
+        availability_mode = self.meta_availability_mode_input.currentData() or "ALL"
         valid_category_ids = {cat_id for cat_id, _ in APP_CATEGORY_OPTIONS if cat_id}
         valid_category_ids.update(ITUNES_GENRE_TO_APP_CATEGORY.values())
         for field in ("primaryCategory", "secondaryCategory"):
@@ -2494,13 +2571,9 @@ class MainWindow(QWidget):
             "contactLastName": self._line_text(self.meta_review_last_name_input),
             "contactPhone": normalize_review_phone(self._line_text(self.meta_review_phone_input)),
             "contactEmail": self._line_text(self.meta_review_email_input),
-            "demoAccountName": self._line_text(self.meta_demo_user_input),
-            "demoAccountPassword": self._line_text(self.meta_demo_password_input),
             "notes": self._text_edit_text(self.meta_review_notes_input)
         }
         app_review_detail = {k: v for k, v in app_review_detail.items() if v not in (None, "")}
-        if app_review_detail or self.meta_demo_required_checkbox.isChecked():
-            app_review_detail["demoAccountRequired"] = self.meta_demo_required_checkbox.isChecked()
 
         custom_requests_text = self._text_edit_text(self.metadata_text)
         custom_requests = []
@@ -2520,6 +2593,10 @@ class MainWindow(QWidget):
             metadata_config["app_info_localizations"] = [app_info_item]
         if app_info:
             metadata_config["app_info"] = app_info
+        metadata_config["availability_mode"] = availability_mode
+        if availability_mode == "SELECTED":
+            metadata_config["availability_territories"] = self.meta_selected_territories
+        metadata_config["collects_data"] = self.meta_collects_data_checkbox.isChecked()
         if app_store_version:
             metadata_config["app_store_version"] = app_store_version
         if app_review_detail:
@@ -2626,11 +2703,6 @@ class MainWindow(QWidget):
             results.append("⚠️ Contact email выглядит некорректно")
         elif email:
             results.append(f"✅ Contact email: {email}")
-        if self.meta_demo_required_checkbox.isChecked():
-            if not self._line_text(self.meta_demo_user_input) or not self._line_text(self.meta_demo_password_input):
-                results.append("❌ Demo account: нужны login и password")
-            else:
-                results.append("✅ Demo account: login/password указаны")
         kids_band = self._line_text(self.meta_kids_age_band_input)
         if kids_band and kids_band not in {"", "FIVE_AND_UNDER", "SIX_TO_EIGHT", "NINE_TO_ELEVEN"}:
             results.append(
@@ -2647,6 +2719,75 @@ class MainWindow(QWidget):
     def _toggle_locales(self, state):
         for cb in self.locale_checkboxes:
             cb.setChecked(state)
+
+    def _on_availability_mode_changed(self):
+        is_selected_mode = (self.meta_availability_mode_input.currentData() == "SELECTED")
+        self.meta_select_territories_btn.setVisible(is_selected_mode)
+
+    def _fetch_territories_for_selector(self):
+        issuer = self.issuer_input.text().strip()
+        key_id = self.key_input.text().strip()
+        p8_path = self.p8_path_input.text().strip()
+        app_id = self.app_input.text().strip()
+        if not all([issuer, key_id, p8_path, app_id]):
+            raise Exception("Для выбора стран заполните Issuer ID, Key ID, App ID и путь к .p8.")
+        client = ASCClient(issuer, key_id, p8_path, app_id, self._log)
+        return client.get_all_territory_ids()
+
+    def _open_territories_selector(self):
+        try:
+            territory_ids = self._fetch_territories_for_selector()
+        except Exception as e:
+            QMessageBox.warning(self, "Availability", f"Не удалось загрузить страны: {e}")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Выбор стран доступности")
+        dialog.resize(420, 560)
+        layout = QVBoxLayout(dialog)
+        hint = QLabel("По умолчанию включены все страны. Снимайте галочки с ненужных.")
+        layout.addWidget(hint)
+
+        list_widget = QListWidget(dialog)
+        selected_set = set(self.meta_selected_territories or territory_ids)
+        for territory_id in territory_ids:
+            item = QListWidgetItem(territory_id, list_widget)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if territory_id in selected_set else Qt.Unchecked)
+        layout.addWidget(list_widget)
+
+        buttons_row = QHBoxLayout()
+        btn_all = QPushButton("Включить все")
+        btn_none = QPushButton("Снять все")
+        btn_ok = QPushButton("OK")
+        btn_cancel = QPushButton("Отмена")
+        buttons_row.addWidget(btn_all)
+        buttons_row.addWidget(btn_none)
+        buttons_row.addStretch(1)
+        buttons_row.addWidget(btn_cancel)
+        buttons_row.addWidget(btn_ok)
+        layout.addLayout(buttons_row)
+
+        def set_all(state):
+            for i in range(list_widget.count()):
+                list_widget.item(i).setCheckState(Qt.Checked if state else Qt.Unchecked)
+
+        btn_all.clicked.connect(lambda: set_all(True))
+        btn_none.clicked.connect(lambda: set_all(False))
+        btn_ok.clicked.connect(dialog.accept)
+        btn_cancel.clicked.connect(dialog.reject)
+
+        if dialog.exec() == QDialog.Accepted:
+            selected = []
+            for i in range(list_widget.count()):
+                item = list_widget.item(i)
+                if item.checkState() == Qt.Checked:
+                    selected.append(item.text())
+            if not selected:
+                QMessageBox.warning(self, "Availability", "Нужно выбрать хотя бы одну страну.")
+                return
+            self.meta_selected_territories = selected
+            self.meta_select_territories_btn.setText(f"Выбрано стран: {len(selected)}")
 
     def _set_screenshot_controls_visible(self, visible):
         for control in self.screenshot_controls:
