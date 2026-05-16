@@ -1160,38 +1160,6 @@ class MetadataWorker(QThread):
             self.finished.emit()
 
 
-class AppPrivacyWorker(QThread):
-    log_msg = Signal(str)
-    progress_update = Signal(int, str)
-    finished = Signal()
-
-    def __init__(self, api_creds, usages_config, publish=True):
-        super().__init__()
-        self.api_creds = api_creds
-        self.usages_config = usages_config
-        self.publish = publish
-
-    def run(self):
-        try:
-            self.progress_update.emit(5, "Подключение к App Store Connect...")
-            client = ASCClient(
-                self.api_creds["issuer"],
-                self.api_creds["key_id"],
-                self.api_creds["p8_path"],
-                self.api_creds["app_id"],
-                self.log_msg.emit
-            )
-            self.progress_update.emit(20, "Синхронизация App Privacy...")
-            created = client.sync_app_privacy_details(self.usages_config, publish=self.publish)
-            self.progress_update.emit(100, "App Privacy загружена")
-            self.log_msg.emit(f"=== APP PRIVACY ЗАГРУЖЕНА ({created} записей) ===")
-        except Exception as e:
-            self.progress_update.emit(0, "Ошибка App Privacy")
-            self.log_msg.emit(f"КРИТИЧЕСКАЯ ОШИБКА APP PRIVACY: {str(e)}")
-        finally:
-            self.finished.emit()
-
-
 class FetchCurrentMetadataWorker(QThread):
     log_msg = Signal(str)
     metadata_fetched = Signal(dict)
@@ -2109,56 +2077,6 @@ class MainWindow(QWidget):
         screens_upload_layout.addWidget(self.btn_execute_upload)
         self.tabs.addTab(self.tab_screens_upload, "🖼️ ЗАГРУЗКА СКРИНОВ")
 
-        self.tab_privacy = QWidget()
-        privacy_layout = QVBoxLayout(self.tab_privacy)
-        privacy_layout.addWidget(QLabel("App Privacy: загрузка декларации в App Store Connect (API appDataUsages)"))
-        privacy_layout.addWidget(QLabel(
-            "По умолчанию: Device ID → Analytics, not tracking, not linked; "
-            "Crash Data → Analytics, tracking, not linked. "
-            "Нужны права Admin/Account Holder на API-ключ."
-        ))
-
-        privacy_defaults_group = QGroupBox("Data Types")
-        privacy_defaults_layout = QFormLayout(privacy_defaults_group)
-        self.privacy_device_id_enabled = QCheckBox("Device ID")
-        self.privacy_device_id_enabled.setChecked(True)
-        self.privacy_device_id_tracking = QCheckBox("Used for tracking")
-        self.privacy_device_id_tracking.setChecked(False)
-        self.privacy_device_id_linked = QCheckBox("Linked to user")
-        self.privacy_device_id_linked.setChecked(False)
-        self.privacy_crash_data_enabled = QCheckBox("Crash Data")
-        self.privacy_crash_data_enabled.setChecked(True)
-        self.privacy_crash_data_tracking = QCheckBox("Used for tracking")
-        self.privacy_crash_data_tracking.setChecked(True)
-        self.privacy_crash_data_linked = QCheckBox("Linked to user")
-        self.privacy_crash_data_linked.setChecked(False)
-        privacy_defaults_layout.addRow("Device ID:", self.privacy_device_id_enabled)
-        privacy_defaults_layout.addRow("Device ID tracking:", self.privacy_device_id_tracking)
-        privacy_defaults_layout.addRow("Device ID linked:", self.privacy_device_id_linked)
-        privacy_defaults_layout.addRow("Crash Data:", self.privacy_crash_data_enabled)
-        privacy_defaults_layout.addRow("Crash Data tracking:", self.privacy_crash_data_tracking)
-        privacy_defaults_layout.addRow("Crash Data linked:", self.privacy_crash_data_linked)
-        privacy_layout.addWidget(privacy_defaults_group)
-
-        self.privacy_publish_checkbox = QCheckBox("Опубликовать в App Store Connect после загрузки")
-        self.privacy_publish_checkbox.setChecked(True)
-        privacy_layout.addWidget(self.privacy_publish_checkbox)
-
-        privacy_buttons_layout = QHBoxLayout()
-        self.btn_preview_privacy = QPushButton("🔍 Preview JSON")
-        self.btn_preview_privacy.clicked.connect(self._preview_app_privacy)
-        self.btn_upload_privacy = QPushButton("🔐 Загрузить в App Store Connect")
-        self.btn_upload_privacy.clicked.connect(self._upload_app_privacy)
-        privacy_buttons_layout.addWidget(self.btn_preview_privacy)
-        privacy_buttons_layout.addWidget(self.btn_upload_privacy)
-        privacy_layout.addLayout(privacy_buttons_layout)
-
-        self.privacy_preview_text = QTextEdit()
-        self.privacy_preview_text.setReadOnly(True)
-        self.privacy_preview_text.setMinimumHeight(140)
-        privacy_layout.addWidget(self.privacy_preview_text)
-        self.tabs.addTab(self.tab_privacy, "🔐 APP PRIVACY")
-
         self.lbl_folders = QLabel("ВЫБОР СКРИНШОТОВ (Для PPO режимов)")
         self.lbl_folders.setContentsMargins(0, 10, 0, 5)
         layout.addWidget(self.lbl_folders)
@@ -2318,71 +2236,6 @@ class MainWindow(QWidget):
             self._log(f"Prompt profile сохранен: {profile_name}")
         except Exception as e:
             self._log(f"Ошибка сохранения prompt profile: {e}")
-
-    def _app_privacy_config(self):
-        config = []
-        if self.privacy_device_id_enabled.isChecked():
-            protections = []
-            if self.privacy_device_id_linked.isChecked():
-                protections.append("DATA_LINKED_TO_YOU")
-            else:
-                protections.append("DATA_NOT_LINKED_TO_YOU")
-            if self.privacy_device_id_tracking.isChecked():
-                protections.append("DATA_USED_TO_TRACK_YOU")
-            config.append({
-                "category": "DEVICE_ID",
-                "purposes": ["ANALYTICS"],
-                "data_protections": sorted(set(protections))
-            })
-        if self.privacy_crash_data_enabled.isChecked():
-            protections = []
-            if self.privacy_crash_data_linked.isChecked():
-                protections.append("DATA_LINKED_TO_YOU")
-            else:
-                protections.append("DATA_NOT_LINKED_TO_YOU")
-            if self.privacy_crash_data_tracking.isChecked():
-                protections.append("DATA_USED_TO_TRACK_YOU")
-            config.append({
-                "category": "CRASH_DATA",
-                "purposes": ["ANALYTICS"],
-                "data_protections": sorted(set(protections))
-            })
-        return config
-
-    def _preview_app_privacy(self):
-        config = self._app_privacy_config()
-        text = json.dumps(config, ensure_ascii=False, indent=2)
-        self.privacy_preview_text.setPlainText(text)
-
-    def _upload_app_privacy(self):
-        self._save_env_to_file()
-        api_creds = {
-            "issuer": self.issuer_input.text().strip(),
-            "key_id": self.key_input.text().strip(),
-            "app_id": self.app_input.text().strip(),
-            "p8_path": self.p8_path_input.text().strip()
-        }
-        if not all(api_creds.values()):
-            self._log("Ошибка: Заполните все поля в разделе НАСТРОЙКИ API.")
-            return
-        usages_config = self._app_privacy_config()
-        if not usages_config:
-            self._log("Ошибка: Включите хотя бы один тип данных (Device ID или Crash Data).")
-            return
-        self._preview_app_privacy()
-        publish = self.privacy_publish_checkbox.isChecked()
-        for button in (self.btn_upload_privacy, self.start_btn, self.btn_preview_privacy):
-            button.setEnabled(False)
-        self.progress_bar.setValue(0)
-        self.time_label.setText("App Privacy: 0%")
-        self.privacy_worker = AppPrivacyWorker(api_creds, usages_config, publish=publish)
-        self.privacy_worker.log_msg.connect(self._log)
-        self.privacy_worker.progress_update.connect(self._update_progress)
-        def _privacy_finished():
-            for button in (self.btn_upload_privacy, self.start_btn, self.btn_preview_privacy):
-                button.setEnabled(True)
-        self.privacy_worker.finished.connect(_privacy_finished)
-        self.privacy_worker.start()
 
     def _line_text(self, widget):
         if isinstance(widget, QComboBox):
