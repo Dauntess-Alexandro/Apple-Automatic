@@ -2255,8 +2255,8 @@ class CollapsibleApiPanel(QGroupBox):
         self.setCheckable(True)
         self.setChecked(True)
         root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(12, 12, 12, 10)
-        root_layout.setSpacing(8)
+        root_layout.setContentsMargins(16, 14, 16, 14)
+        root_layout.setSpacing(10)
 
         self.summary_label = QLabel("")
         self.summary_label.setProperty("role", "hint")
@@ -2289,8 +2289,8 @@ class VariantFolderCard(QFrame):
         self.setObjectName("variant_card")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
 
         title = QLabel(variant_name)
         title.setProperty("role", "section")
@@ -2343,7 +2343,7 @@ class LocalePickerWidget(QGroupBox):
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         controls_row = QHBoxLayout()
@@ -2375,7 +2375,7 @@ class LocalePickerWidget(QGroupBox):
         self.grid = QGridLayout(self.scroll_widget)
         self.grid.setContentsMargins(8, 8, 8, 8)
         self.grid.setHorizontalSpacing(14)
-        self.grid.setVerticalSpacing(4)
+        self.grid.setVerticalSpacing(6)
         self.grid.setAlignment(Qt.AlignTop)
         for column in range(self._columns):
             self.grid.setColumnMinimumWidth(column, UI_LOCALE_COLUMN_MIN_WIDTH)
@@ -2514,7 +2514,7 @@ class MainWindow(QWidget):
         super().__init__()
         ensure_flags_downloaded()
         
-        self.setWindowTitle("PPO Automation Control (PRO Mode)")
+        self.setWindowTitle("PPO Automation")
         self._initial_width, self._initial_height = default_window_size()
         self.resize(self._initial_width, self._initial_height)
         self.setMinimumSize(1280, 820)
@@ -2526,8 +2526,8 @@ class MainWindow(QWidget):
 
     def _setup_ui(self):
         root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(12, 12, 12, 12)
-        root_layout.setSpacing(10)
+        root_layout.setContentsMargins(18, 18, 18, 18)
+        root_layout.setSpacing(12)
 
         sorted_locales = sorted(LOCALE_MAP.items(), key=lambda item: item[1][1])
 
@@ -2584,6 +2584,11 @@ class MainWindow(QWidget):
         apple_grid.setColumnStretch(2, 2)
         apple_grid.setColumnStretch(3, 0)
         api_layout.addLayout(apple_grid)
+
+        api_separator = QFrame()
+        api_separator.setFrameShape(QFrame.HLine)
+        api_separator.setStyleSheet("QFrame { color: #26324A; margin: 4px 0; }")
+        api_layout.addWidget(api_separator)
 
         tinypng_label = QLabel("TinyPNG API key (сжатие скриншотов)")
         tinypng_label.setProperty("role", "section")
@@ -3240,8 +3245,9 @@ class MainWindow(QWidget):
             }
             QLabel { color: #EAF0FF; font-weight: 500; background: transparent; }
             QLabel[role="title"] { font-size: 20px; color: #F7FAFF; font-weight: 700; letter-spacing: 0.2px; }
-            QLabel[role="section"] { font-size: 12px; color: #9FB2D8; font-weight: 700; text-transform: uppercase; }
+            QLabel[role="section"] { font-size: 11px; color: #9FB2D8; font-weight: 700; text-transform: uppercase; letter-spacing: 1.5px; }
             QLabel[role="hint"] { color: #93A4C8; font-weight: 400; font-size: 13px; }
+            QLabel[role="label"] { color: #C7D2FE; font-weight: 600; font-size: 13px; }
             QLabel[status="ok"] { color: #4ADE80; font-weight: 600; }
             QLabel[status="warn"] { color: #FBBF24; font-weight: 600; }
 
@@ -3253,6 +3259,7 @@ class MainWindow(QWidget):
             QWidget#execution_panel {
                 background-color: #0D1728;
                 border: 1px solid #26324A;
+                border-top: 3px solid #6D8DFF;
                 border-radius: 10px;
                 padding: 8px;
             }
@@ -3298,32 +3305,33 @@ class MainWindow(QWidget):
             QPushButton:disabled { background-color: #101828; border-color: #1E293B; color: #64748B; }
             
             QPushButton#start_btn {
-                background-color: #6D8DFF;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #7C9CFF, stop:1 #5A7AE8);
                 color: #07111F;
                 font-size: 15px;
-                border: 1px solid #8EA5FF;
+                border: none;
                 border-radius: 10px;
                 font-weight: 700;
                 padding: 12px 16px;
             }
-            QPushButton#start_btn:hover { background-color: #7C9CFF; border-color: #A3B7FF; }
-            QPushButton#start_btn:disabled { background-color: #1E293B; color: #64748B; border-color: #334155; }
+            QPushButton#start_btn:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #8EAAFF, stop:1 #6D8DFF); }
+            QPushButton#start_btn:disabled { background: #1E293B; color: #64748B; }
 
             QPushButton#upload_cta_btn {
-                background-color: #6D8DFF;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #7C9CFF, stop:1 #5A7AE8);
                 color: #07111F;
                 font-size: 16px;
-                border: 1px solid #8EA5FF;
+                border: none;
                 border-radius: 12px;
                 font-weight: 800;
                 padding: 14px 18px;
             }
-            QPushButton#upload_cta_btn:hover { background-color: #7C9CFF; border-color: #A3B7FF; }
-            QPushButton#upload_cta_btn:disabled { background-color: #1E293B; color: #64748B; border-color: #334155; }
+            QPushButton#upload_cta_btn:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #8EAAFF, stop:1 #6D8DFF); }
+            QPushButton#upload_cta_btn:disabled { background: #1E293B; color: #64748B; }
 
             QPushButton#utility_btn {
-                padding: 7px 10px;
-                font-size: 13px;
+                padding: 5px 10px;
+                font-size: 12px;
+                border-radius: 6px;
                 color: #DCE7FF;
                 font-weight: 500;
                 background-color: #151F32;
@@ -3355,17 +3363,18 @@ class MainWindow(QWidget):
             QComboBox QAbstractItemView { background-color: #111827; color: #F8FAFC; selection-background-color: #243B63; border-radius: 5px; }
             
             QTabWidget::pane { border: 1px solid #26324A; border-radius: 10px; background-color: #0E1628; margin-top: -1px; top: -1px; }
-            QTabBar::tab { 
+            QTabBar::tab {
                 background: #111827; border: 1px solid #26324A;
                 border-top-left-radius: 8px; border-top-right-radius: 8px;
-                padding: 10px 18px; margin-right: 4px; color: #9FB2D8; 
+                padding: 8px 18px; margin-right: 4px; color: #9FB2D8;
                 min-width: 96px;
+                border-top: 2px solid transparent;
             }
-            QTabBar::tab:selected { background: #18243A; border-color: #4F8CFF; color: #F7FAFF; font-weight: 700; }
+            QTabBar::tab:selected { background: #18243A; border-color: #4F8CFF; border-top: 2px solid #6D8DFF; color: #F7FAFF; font-weight: 700; }
             QTabBar::tab:hover:!selected { background: #172033; color: #DCE7FF; }
             
-            QProgressBar { border: 1px solid #2B3A55; border-radius: 8px; background-color: #0F172A; text-align: center; color: #F8FAFC; font-weight: 700; height: 26px; }
-            QProgressBar::chunk { background-color: #6D8DFF; border-radius: 6px; }
+            QProgressBar { border: 1px solid #2B3A55; border-radius: 8px; background-color: #0F172A; text-align: center; color: #F8FAFC; font-weight: 700; height: 30px; }
+            QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #5A7AE8, stop:1 #7C9CFF); border-radius: 6px; }
             
             QCheckBox { color: #E2E8F0; spacing: 9px; padding: 4px 2px; background: transparent; }
             QCheckBox:hover { background: transparent; }
@@ -3411,9 +3420,10 @@ class MainWindow(QWidget):
             }
 
             QFrame#drop_zone {
-                border: 1px dashed #4F8CFF;
-                border-radius: 10px;
+                border: 2px dashed #4F8CFF;
+                border-radius: 12px;
                 background-color: #0F172A;
+                min-height: 80px;
             }
             QFrame#drop_zone:hover {
                 background-color: #13213A;

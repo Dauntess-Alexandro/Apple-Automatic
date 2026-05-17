@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app_store_ppo_automation.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app_store_ppo_automation.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('c:/Apple Automatic/app_store_ppo_automation.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
+    ]
+  }
+}
