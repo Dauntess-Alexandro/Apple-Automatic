@@ -1907,6 +1907,87 @@ Hard safety rules:
             self.finished.emit()
 
 
+class JiraWorker(QThread):
+    log_msg = Signal(str)
+    finished = Signal()
+    success = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, base_url, email, api_token, project_key, issue_type, metadata):
+        super().__init__()
+        self.base_url = base_url.rstrip("/")
+        self.email = email
+        self.api_token = api_token
+        self.project_key = project_key
+        self.issue_type = issue_type
+        self.metadata = metadata
+
+    def run(self):
+        import base64
+        try:
+            auth = base64.b64encode(f"{self.email}:{self.api_token}".encode()).decode()
+            headers = {
+                "Authorization": f"Basic {auth}",
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
+
+            # Build ADF description
+            content = []
+            meta = self.metadata
+            fields = [
+                ("Description", meta.get("description", "")),
+                ("Subtitle", meta.get("subtitle", "")),
+                ("Keywords", meta.get("keywords", "")),
+                ("Support URL", meta.get("support_url", "")),
+                ("Privacy Policy URL", meta.get("privacy_policy_url", "")),
+                ("Category", meta.get("primary_category", "")),
+            ]
+            for label, value in fields:
+                if not value:
+                    continue
+                content.append({
+                    "type": "heading", "attrs": {"level": 2},
+                    "content": [{"type": "text", "text": label}]
+                })
+                content.append({
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": str(value)}]
+                })
+
+            summary = f"[ASO] Metadata — {meta.get('app_name', '?')} — {meta.get('locale', '?')}"
+            payload = {
+                "fields": {
+                    "project": {"key": self.project_key},
+                    "issuetype": {"name": self.issue_type or "Story"},
+                    "summary": summary,
+                    "description": {"type": "doc", "version": 1, "content": content},
+                    "labels": ["aso", "metadata"]
+                }
+            }
+
+            self.log_msg.emit(f"Создаю Jira задачу в проекте {self.project_key}...")
+            resp = requests.post(
+                f"{self.base_url}/rest/api/3/issue",
+                headers=headers, json=payload, timeout=30
+            )
+            if not resp.ok:
+                raise Exception(f"Jira returned {resp.status_code}: {resp.text}")
+
+            data = resp.json()
+            issue_key = data.get("key", "?")
+            issue_url = f"{self.base_url}/browse/{issue_key}"
+            self.log_msg.emit(f"Задача создана: {issue_key}")
+            self.success.emit(issue_url)
+
+        except Exception as e:
+            err = str(e)
+            self.log_msg.emit(f"Ошибка Jira: {err}")
+            self.error.emit(err)
+        finally:
+            self.finished.emit()
+
+
 class FetchExperimentsWorker(QThread):
     log_msg = Signal(str)
     experiments_fetched = Signal(list)
@@ -2612,6 +2693,43 @@ class MainWindow(QWidget):
         gemini_row.addWidget(self.gemini_key_input, stretch=2)
         gemini_row.addWidget(self.gemini_model_input, stretch=1)
         api_layout.addLayout(gemini_row)
+
+        jira_separator = QFrame()
+        jira_separator.setFrameShape(QFrame.HLine)
+        jira_separator.setStyleSheet("QFrame { color: #26324A; margin: 4px 0; }")
+        api_layout.addWidget(jira_separator)
+
+        jira_label = QLabel("Jira Cloud (экспорт метаданных)")
+        jira_label.setProperty("role", "section")
+        api_layout.addWidget(jira_label)
+        self.jira_base_url_input = QLineEdit(os.getenv("JIRA_BASE_URL", ""))
+        self.jira_base_url_input.setPlaceholderText("https://your-company.atlassian.net")
+        self.jira_base_url_input.editingFinished.connect(self._save_env_to_file)
+        api_layout.addWidget(self.jira_base_url_input)
+        self.jira_email_input = QLineEdit(os.getenv("JIRA_EMAIL", ""))
+        self.jira_email_input.setPlaceholderText("your@email.com")
+        self.jira_email_input.editingFinished.connect(self._save_env_to_file)
+        api_layout.addWidget(self.jira_email_input)
+        self.jira_api_token_input = QLineEdit(os.getenv("JIRA_API_TOKEN", ""))
+        self.jira_api_token_input.setPlaceholderText("Jira API Token (Account → Security → API tokens)")
+        self.jira_api_token_input.setEchoMode(QLineEdit.Password)
+        self.jira_api_token_input.editingFinished.connect(self._save_env_to_file)
+        api_layout.addWidget(self.jira_api_token_input)
+        jira_project_row = QHBoxLayout()
+        self.jira_project_key_input = QLineEdit(os.getenv("JIRA_PROJECT_KEY", ""))
+        self.jira_project_key_input.setPlaceholderText("APP")
+        self.jira_project_key_input.setMaximumWidth(120)
+        self.jira_project_key_input.editingFinished.connect(self._save_env_to_file)
+        self.jira_issue_type_input = QLineEdit(os.getenv("JIRA_ISSUE_TYPE", "Story"))
+        self.jira_issue_type_input.setPlaceholderText("Story")
+        self.jira_issue_type_input.setMaximumWidth(100)
+        self.jira_issue_type_input.editingFinished.connect(self._save_env_to_file)
+        jira_project_row.addWidget(QLabel("Project:"))
+        jira_project_row.addWidget(self.jira_project_key_input)
+        jira_project_row.addWidget(QLabel("Type:"))
+        jira_project_row.addWidget(self.jira_issue_type_input)
+        jira_project_row.addStretch()
+        api_layout.addLayout(jira_project_row)
         root_layout.addWidget(self.api_panel)
 
         self.main_splitter = QSplitter(Qt.Horizontal)
@@ -2815,6 +2933,18 @@ class MainWindow(QWidget):
         self.meta_app_version_input.setReadOnly(True)
         locale_form.addRow("Версия:", self.meta_app_version_input)
         metadata_form_layout.addWidget(locale_group)
+
+        jira_row = QHBoxLayout()
+        self.btn_create_jira = QPushButton("📋 Создать задачу в Jira")
+        self.btn_create_jira.setObjectName("start_btn")
+        self.btn_create_jira.setMinimumHeight(42)
+        self.btn_create_jira.setMinimumWidth(200)
+        self.btn_create_jira.clicked.connect(self._create_jira_issue)
+        jira_hint = QLabel("Экспортирует все заполненные метаданные (description, subtitle, keywords, URLs, category) в Jira Cloud")
+        jira_hint.setProperty("role", "hint")
+        jira_row.addWidget(self.btn_create_jira)
+        jira_row.addWidget(jira_hint, stretch=1)
+        metadata_form_layout.addLayout(jira_row)
 
         version_group = QGroupBox("Version metadata")
         version_form = QFormLayout(version_group)
@@ -4157,6 +4287,43 @@ class MainWindow(QWidget):
             metadata_config["custom_requests"] = custom_requests
         return metadata_config
 
+    def _collect_metadata_for_jira(self):
+        return {
+            "app_name": self.meta_name_input.text().strip() or "—",
+            "locale": self.meta_locale_combo.currentData() or "en-US",
+            "description": self._text_edit_text(self.meta_description_input),
+            "subtitle": self._line_text(self.meta_subtitle_input),
+            "keywords": self._line_text(self.meta_keywords_input),
+            "support_url": self._line_text(self.meta_support_url_input),
+            "privacy_policy_url": self._line_text(self.meta_privacy_policy_url_input),
+            "primary_category": self.meta_primary_category_input.currentText(),
+        }
+
+    def _create_jira_issue(self):
+        base_url = self.jira_base_url_input.text().strip()
+        email = self.jira_email_input.text().strip()
+        api_token = self.jira_api_token_input.text().strip()
+        project_key = self.jira_project_key_input.text().strip()
+        issue_type = self.jira_issue_type_input.text().strip() or "Story"
+
+        if not all([base_url, email, api_token, project_key]):
+            self._log("⚠️ Заполните Jira: Base URL, Email, API Token и Project Key в настройках API")
+            return
+
+        metadata = self._collect_metadata_for_jira()
+        self.btn_create_jira.setEnabled(False)
+        self._log("Создаю задачу в Jira...")
+        self.jira_worker = JiraWorker(base_url, email, api_token, project_key, issue_type, metadata)
+        self.jira_worker.log_msg.connect(self._log)
+        self.jira_worker.success.connect(self._on_jira_success)
+        self.jira_worker.error.connect(lambda _: self.btn_create_jira.setEnabled(True))
+        self.jira_worker.finished.connect(lambda: self.btn_create_jira.setEnabled(True))
+        self.jira_worker.start()
+
+    def _on_jira_success(self, issue_url):
+        self._log(f"✅ Jira задача создана: {issue_url}")
+        QDesktopServices.openUrl(QUrl(issue_url))
+
     def _check_length(self, label, text, limit, results):
         length = len(text)
         if not text:
@@ -4403,6 +4570,16 @@ class MainWindow(QWidget):
             env_content += f"GEMINI_API_KEY={self.gemini_key_input.text().strip()}\n"
         if hasattr(self, "gemini_model_input"):
             env_content += f"GEMINI_MODEL={self.gemini_model_input.text().strip()}\n"
+        if hasattr(self, "jira_base_url_input"):
+            env_content += f"JIRA_BASE_URL={self.jira_base_url_input.text().strip()}\n"
+        if hasattr(self, "jira_email_input"):
+            env_content += f"JIRA_EMAIL={self.jira_email_input.text().strip()}\n"
+        if hasattr(self, "jira_api_token_input"):
+            env_content += f"JIRA_API_TOKEN={self.jira_api_token_input.text().strip()}\n"
+        if hasattr(self, "jira_project_key_input"):
+            env_content += f"JIRA_PROJECT_KEY={self.jira_project_key_input.text().strip()}\n"
+        if hasattr(self, "jira_issue_type_input"):
+            env_content += f"JIRA_ISSUE_TYPE={self.jira_issue_type_input.text().strip()}\n"
         try:
             with open(ENV_PATH, "w", encoding="utf-8") as f: f.write(env_content)
         except Exception as e:
