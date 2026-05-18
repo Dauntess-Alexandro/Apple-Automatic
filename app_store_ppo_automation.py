@@ -296,7 +296,9 @@ TRANSLATION_FIELDS = [
     ("subtitle", "Subtitle", 30, "app_info"),
 ]
 
-TRANSLATION_MAX_WORKERS = 6
+TRANSLATION_MAX_WORKERS = int(os.getenv("TRANSLATION_MAX_WORKERS", "3"))
+TRANSLATION_REQUEST_INTERVAL_SECONDS = float(os.getenv("TRANSLATION_REQUEST_INTERVAL_SECONDS", "2.2"))
+TRANSLATION_FALLBACK_MODEL = os.getenv("TRANSLATION_FALLBACK_MODEL", "gemini-2.5-flash-lite")
 
 TRANSLATION_PROFILES = {
     "ASO natural": (
@@ -1829,8 +1831,31 @@ class GeminiLocalizationTranslationWorker(QThread):
         self.fields = fields
         self.profile_name = profile_name
         self.source_payload = source_payload
+        self._request_lock = threading.Lock()
+        self._last_request_at = 0.0
 
-    def _translate_field(self, target_locale, field_name, source_text):
+    def _wait_for_translation_slot(self):
+        if TRANSLATION_REQUEST_INTERVAL_SECONDS <= 0:
+            return
+        with self._request_lock:
+            elapsed = time.monotonic() - self._last_request_at
+            wait_for = TRANSLATION_REQUEST_INTERVAL_SECONDS - elapsed
+            if wait_for > 0:
+                time.sleep(wait_for)
+            self._last_request_at = time.monotonic()
+
+    def _parse_gemini_error(self, response):
+        try:
+            payload = response.json()
+        except ValueError:
+            return response.text[:500]
+        error = payload.get("error", {})
+        message = error.get("message") or response.text[:500]
+        if "Quota exceeded" in message or error.get("status") == "RESOURCE_EXHAUSTED":
+            return "quota exceeded: " + message.splitlines()[0]
+        return message.splitlines()[0] if message else response.text[:500]
+
+    def _translate_field_with_model(self, model, target_locale, field_name, source_text):
         prompt_rule = TRANSLATION_PROFILES.get(self.profile_name, TRANSLATION_PROFILES["ASO natural"])
         prompt = f"""
 Translate App Store metadata field.
@@ -1847,13 +1872,14 @@ Source text:
 {source_text}
 """.strip()
 
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.2},
         }
         response = None
         for attempt in range(4):
+            self._wait_for_translation_slot()
             response = requests.post(
                 endpoint,
                 headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
@@ -1861,15 +1887,45 @@ Source text:
                 timeout=90,
             )
             if response.status_code not in (429, 500, 502, 503, 504):
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    raise Exception(self._parse_gemini_error(response))
                 break
             if attempt == 3:
-                response.raise_for_status()
+                raise Exception(self._parse_gemini_error(response))
             time.sleep(2 ** attempt)
         data = response.json()
-        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        candidates = data.get("candidates") or []
+        if not candidates:
+            feedback = data.get("promptFeedback", {})
+            raise Exception(f"empty Gemini candidates: {feedback or 'no details'}")
+        candidate = candidates[0]
+        parts = candidate.get("content", {}).get("parts", [])
         text = "".join(part.get("text", "") for part in parts).strip()
+        if not text:
+            finish_reason = candidate.get("finishReason", "UNKNOWN")
+            raise Exception(f"Gemini returned empty text (finishReason={finish_reason})")
         return text
+
+    def _translate_field(self, target_locale, field_name, source_text):
+        try:
+            return self._translate_field_with_model(self.model, target_locale, field_name, source_text)
+        except Exception as exc:
+            if (
+                TRANSLATION_FALLBACK_MODEL
+                and TRANSLATION_FALLBACK_MODEL != self.model
+                and "quota exceeded" in str(exc).lower()
+            ):
+                self.log_msg.emit(
+                    f"⚠️ {self.model} исчерпал quota, пробую fallback {TRANSLATION_FALLBACK_MODEL}: "
+                    f"{target_locale} · {field_name}"
+                )
+                return self._translate_field_with_model(
+                    TRANSLATION_FALLBACK_MODEL,
+                    target_locale,
+                    field_name,
+                    source_text,
+                )
+            raise
 
     def _translate_task(self, locale, field_name, source_text):
         if not source_text:
@@ -4163,7 +4219,7 @@ class MainWindow(QWidget):
                     item.setData(Qt.UserRole, row_data.get("field", ""))
                 self.translation_table.setItem(row_idx, col_idx, item)
         self.translation_table_busy = False
-        self._validate_translation_table()
+        self._validate_translation_table(preserve_existing_errors=True)
 
     def _status_for_row(self, field_key, translation_text):
         text = str(translation_text or "").strip()
@@ -4208,12 +4264,23 @@ class MainWindow(QWidget):
             if item is not None:
                 item.setBackground(color)
 
-    def _validate_translation_table(self):
+    def _validate_translation_table(self, preserve_existing_errors=False):
         self.translation_table_busy = True
         for row_idx in range(self.translation_table.rowCount()):
             field_item = self.translation_table.item(row_idx, 1)
             translation_item = self.translation_table.item(row_idx, 3)
+            status_item = self.translation_table.item(row_idx, 4)
+            warning_item = self.translation_table.item(row_idx, 5)
             if field_item is None or translation_item is None:
+                continue
+            if (
+                preserve_existing_errors
+                and status_item is not None
+                and warning_item is not None
+                and status_item.text().strip().lower() in {"error", "ошибка"}
+                and warning_item.text().strip()
+            ):
+                self._apply_row_status_style(row_idx, "error", warning_item.text().strip())
                 continue
             field_key = field_item.data(Qt.UserRole) or field_item.text().strip()
             status, warning = self._status_for_row(field_key, translation_item.text())
