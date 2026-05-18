@@ -300,6 +300,58 @@ TRANSLATION_MAX_WORKERS = int(os.getenv("TRANSLATION_MAX_WORKERS", "3"))
 TRANSLATION_REQUEST_INTERVAL_SECONDS = float(os.getenv("TRANSLATION_REQUEST_INTERVAL_SECONDS", "2.2"))
 TRANSLATION_FALLBACK_MODEL = os.getenv("TRANSLATION_FALLBACK_MODEL", "gemini-2.5-flash-lite")
 
+DEEPL_DEFAULT_API_URL = "https://api-free.deepl.com/v2"
+DEEPL_TARGET_LANG_BY_APPSTORE_LOCALE = {
+    "ar-SA": "AR",
+    "bn-BD": "BN",
+    "ca": "CA",
+    "zh-Hans": "ZH-HANS",
+    "zh-Hant": "ZH-HANT",
+    "hr": "HR",
+    "cs": "CS",
+    "da": "DA",
+    "nl-NL": "NL",
+    "en-AU": "EN-GB",
+    "en-CA": "EN-US",
+    "en-GB": "EN-GB",
+    "en-US": "EN-US",
+    "fi": "FI",
+    "fr-CA": "FR",
+    "fr-FR": "FR",
+    "de-DE": "DE",
+    "el": "EL",
+    "gu-IN": "GU",
+    "he": "HE",
+    "hi": "HI",
+    "hu": "HU",
+    "id": "ID",
+    "it": "IT",
+    "ja": "JA",
+    "ko": "KO",
+    "ms": "MS",
+    "ml-IN": "ML",
+    "mr-IN": "MR",
+    "no": "NB",
+    "pl": "PL",
+    "pt-BR": "PT-BR",
+    "pt-PT": "PT-PT",
+    "pa-IN": "PA",
+    "ro": "RO",
+    "ru": "RU",
+    "sk": "SK",
+    "sl-SI": "SL",
+    "es-MX": "ES-419",
+    "es-ES": "ES",
+    "sv": "SV",
+    "ta-IN": "TA",
+    "te-IN": "TE",
+    "th": "TH",
+    "tr": "TR",
+    "uk": "UK",
+    "ur-PK": "UR",
+    "vi": "VI",
+}
+
 TRANSLATION_PROFILES = {
     "ASO natural": (
         "Translate as a senior App Store localization editor. Preserve the original meaning, features, "
@@ -346,6 +398,8 @@ TRANSLATION_STATUS_COLORS = {
     "info": QColor("#1E3A8A"),
     "ok": QColor("#14532D"),
 }
+
+APP_SCREENSHOT_MAX_PER_SET = 10
 
 APP_CATEGORY_OPTIONS = [
     ("", "Не выбрано"),
@@ -1174,6 +1228,12 @@ class ASCClient:
         endpoint = f"appScreenshots/{screenshot_id}"
         self._request("DELETE", endpoint)
 
+    def clear_screenshot_set(self, set_id):
+        screenshots = self.get_screenshots(set_id)
+        for item in screenshots:
+            self.delete_screenshot(item["id"])
+        return len(screenshots)
+
     def create_screenshot_set(self, localization_id, display_type="APP_IPHONE_67"):
         payload = {
             "data": {
@@ -1992,6 +2052,153 @@ Source text:
             self.finished.emit()
 
 
+class DeepLLocalizationTranslationWorker(QThread):
+    log_msg = Signal(str)
+    progress_update = Signal(int, str)
+    translations_ready = Signal(list)
+    finished = Signal()
+
+    def __init__(self, api_key, source_locale, target_locales, fields, source_payload, api_url=None):
+        super().__init__()
+        self.api_key = api_key
+        self.source_locale = source_locale
+        self.target_locales = target_locales
+        self.fields = fields
+        self.source_payload = source_payload
+        self.api_url = (api_url or DEEPL_DEFAULT_API_URL).rstrip("/")
+        self._request_lock = threading.Lock()
+        self._last_request_at = 0.0
+
+    def _wait_for_translation_slot(self):
+        if TRANSLATION_REQUEST_INTERVAL_SECONDS <= 0:
+            return
+        with self._request_lock:
+            elapsed = time.monotonic() - self._last_request_at
+            wait_for = TRANSLATION_REQUEST_INTERVAL_SECONDS - elapsed
+            if wait_for > 0:
+                time.sleep(wait_for)
+            self._last_request_at = time.monotonic()
+
+    def _deepl_target_lang(self, app_store_locale):
+        return DEEPL_TARGET_LANG_BY_APPSTORE_LOCALE.get(app_store_locale)
+
+    def _parse_deepl_error(self, response):
+        try:
+            payload = response.json()
+            message = payload.get("message") or payload.get("detail") or response.text
+        except ValueError:
+            message = response.text
+        if response.status_code == 403:
+            return "DeepL rejected API key or endpoint (403). Check api-free vs api.deepl.com."
+        if response.status_code == 456:
+            return "DeepL quota exceeded (456)."
+        if response.status_code == 429:
+            return "DeepL rate limit exceeded (429)."
+        return f"DeepL HTTP {response.status_code}: {str(message)[:500]}"
+
+    def _translate_field(self, target_locale, field_name, source_text):
+        target_lang = self._deepl_target_lang(target_locale)
+        if not target_lang:
+            raise Exception(f"DeepL не поддерживает locale {target_locale} в текущем маппинге.")
+
+        payload = {
+            "text": source_text,
+            "target_lang": target_lang,
+            "preserve_formatting": "1",
+        }
+        self._wait_for_translation_slot()
+        response = requests.post(
+            f"{self.api_url}/translate",
+            headers={"Authorization": f"DeepL-Auth-Key {self.api_key}"},
+            data=payload,
+            timeout=90,
+        )
+        if response.status_code >= 400:
+            raise Exception(self._parse_deepl_error(response))
+        data = response.json()
+        translations = data.get("translations") or []
+        if not translations:
+            raise Exception("DeepL вернул пустой список translations.")
+        text = str(translations[0].get("text", "")).strip()
+        if not text:
+            raise Exception("DeepL вернул пустой перевод.")
+        return text
+
+    def _translate_task(self, locale, field_name, source_text):
+        if not source_text:
+            return {
+                "locale": locale,
+                "field": field_name,
+                "source": "",
+                "translation": "",
+                "status": "warn",
+                "warning": "Пустой source для поля",
+            }
+        if not self._deepl_target_lang(locale):
+            return {
+                "locale": locale,
+                "field": field_name,
+                "source": source_text,
+                "translation": source_text,
+                "status": "ok",
+                "warning": f"DeepL не поддерживает {locale}; оставлен source text.",
+            }
+        try:
+            translated = self._translate_field(locale, field_name, source_text)
+            return {
+                "locale": locale,
+                "field": field_name,
+                "source": source_text,
+                "translation": translated,
+                "status": "ok",
+                "warning": "",
+            }
+        except Exception as field_exc:
+            return {
+                "locale": locale,
+                "field": field_name,
+                "source": source_text,
+                "translation": "",
+                "status": "error",
+                "warning": f"Ошибка DeepL: {field_exc}",
+            }
+
+    def run(self):
+        rows = []
+        try:
+            tasks = []
+            for locale in self.target_locales:
+                for field_name in self.fields:
+                    source_text = str(self.source_payload.get(field_name, "") or "").strip()
+                    tasks.append((locale, field_name, source_text))
+
+            total = max(1, len(tasks))
+            done = 0
+            max_workers = min(TRANSLATION_MAX_WORKERS, total)
+            self.log_msg.emit(f"DeepL перевод: {total} задач, потоков: {max_workers}")
+            self.progress_update.emit(0, f"DeepL: 0/{total}")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_task = {
+                    executor.submit(self._translate_task, locale, field_name, source_text): (locale, field_name)
+                    for locale, field_name, source_text in tasks
+                }
+                for future in concurrent.futures.as_completed(future_to_task):
+                    locale, field_name = future_to_task[future]
+                    row = future.result()
+                    rows.append(row)
+                    done += 1
+                    self.log_msg.emit(f"DeepL {done}/{total}: {locale} · {field_name} · {row.get('status')}")
+                    percent = int(done * 100 / total)
+                    self.progress_update.emit(percent, f"DeepL: {done}/{total}")
+            self.translations_ready.emit(rows)
+            self.progress_update.emit(100, "DeepL перевод завершен")
+            self.log_msg.emit("✅ DeepL перевод локализаций завершен.")
+        except Exception as e:
+            self.log_msg.emit(f"Ошибка DeepL перевода локализаций: {str(e)}")
+        finally:
+            self.finished.emit()
+
+
 class LocalizationUploadWorker(QThread):
     log_msg = Signal(str)
     progress_update = Signal(int, str)
@@ -2605,9 +2812,20 @@ class ScreenshotUploadWorker(QThread):
                 else:
                     target_set_id = target_set["id"]
 
-                for idx, file_path in enumerate(prepared_files, start=1):
+                removed = local_client.clear_screenshot_set(target_set_id)
+                if removed:
+                    self.log_msg.emit(f"[{locale}] Удалено старых скринов: {removed}")
+
+                files_to_upload = prepared_files[:APP_SCREENSHOT_MAX_PER_SET]
+                if len(prepared_files) > APP_SCREENSHOT_MAX_PER_SET:
+                    self.log_msg.emit(
+                        f"[{locale}] ⚠️ Apple допускает максимум {APP_SCREENSHOT_MAX_PER_SET} скринов. "
+                        f"Будут загружены первые {APP_SCREENSHOT_MAX_PER_SET} из {len(prepared_files)}."
+                    )
+
+                for idx, file_path in enumerate(files_to_upload, start=1):
                     file_name = f"{idx}_{os.path.basename(self.jpeg_files[idx - 1])}"
-                    self.log_msg.emit(f"[{locale}] Upload {idx}/{len(prepared_files)}: {file_name}")
+                    self.log_msg.emit(f"[{locale}] Upload {idx}/{len(files_to_upload)}: {file_name}")
                     local_client.upload_screenshot(target_set_id, file_path, file_name)
                     tick()
                     time.sleep(1)
@@ -2996,6 +3214,15 @@ class MainWindow(QWidget):
         gemini_row.addWidget(self.gemini_key_input, stretch=2)
         gemini_row.addWidget(self.gemini_model_input, stretch=1)
         api_layout.addLayout(gemini_row)
+
+        deepl_label = QLabel("DeepL API (перевод локализаций)")
+        deepl_label.setProperty("role", "section")
+        api_layout.addWidget(deepl_label)
+        self.deepl_key_input = QLineEdit(os.getenv("DEEPL_API_KEY", ""))
+        self.deepl_key_input.setPlaceholderText("DeepL API key (:fx = api-free.deepl.com)")
+        self.deepl_key_input.setEchoMode(QLineEdit.Password)
+        self.deepl_key_input.editingFinished.connect(self._save_env_to_file)
+        api_layout.addWidget(self.deepl_key_input)
 
         jira_separator = QFrame()
         jira_separator.setFrameShape(QFrame.HLine)
@@ -3601,7 +3828,8 @@ class MainWindow(QWidget):
 
         for widget in [
             self.issuer_input, self.key_input, self.app_input, self.p8_path_input,
-            self.tinypng_key_input, self.gemini_key_input, self.gemini_model_input
+            self.tinypng_key_input, self.gemini_key_input, self.gemini_model_input,
+            self.deepl_key_input
         ]:
             widget.textChanged.connect(self._update_api_summary)
         self.app_input.textChanged.connect(self._on_app_id_changed)
@@ -4171,25 +4399,25 @@ class MainWindow(QWidget):
         if not fields:
             self._log("Ошибка: выберите хотя бы одно поле для перевода.")
             return
-        api_key = self.gemini_key_input.text().strip()
-        model = self.gemini_model_input.text().strip() or "gemini-2.5-flash"
+        api_key = self.deepl_key_input.text().strip()
         if not api_key:
-            self._log("Ошибка: укажите Gemini API key в верхнем блоке настроек API.")
+            self._log("Ошибка: укажите DeepL API key в верхнем блоке настроек API.")
             return
 
         source_locale = self.translation_source_locale_combo.currentData() or "en-US"
-        profile = self.translation_profile_combo.currentText().strip() or "ASO natural"
         self._set_translation_buttons_enabled(False)
         self.progress_bar.setValue(0)
-        self.time_label.setText("Перевод: 0%")
-        self.translation_worker = GeminiLocalizationTranslationWorker(
+        self.time_label.setText("DeepL перевод: 0%")
+        api_url = os.getenv("DEEPL_API_URL", "").strip()
+        if not api_url:
+            api_url = DEEPL_DEFAULT_API_URL if api_key.endswith(":fx") else "https://api.deepl.com/v2"
+        self.translation_worker = DeepLLocalizationTranslationWorker(
             api_key=api_key,
-            model=model,
             source_locale=source_locale,
             target_locales=target_locales,
             fields=fields,
-            profile_name=profile,
             source_payload=self.translation_source_payload,
+            api_url=api_url,
         )
         self.translation_worker.log_msg.connect(self._log)
         self.translation_worker.progress_update.connect(self._update_progress)
@@ -5020,6 +5248,8 @@ class MainWindow(QWidget):
             env_content += f"GEMINI_API_KEY={self.gemini_key_input.text().strip()}\n"
         if hasattr(self, "gemini_model_input"):
             env_content += f"GEMINI_MODEL={self.gemini_model_input.text().strip()}\n"
+        if hasattr(self, "deepl_key_input"):
+            env_content += f"DEEPL_API_KEY={self.deepl_key_input.text().strip()}\n"
         if hasattr(self, "jira_base_url_input"):
             env_content += f"JIRA_BASE_URL={self.jira_base_url_input.text().strip()}\n"
         if hasattr(self, "jira_email_input"):
@@ -5295,6 +5525,11 @@ class MainWindow(QWidget):
         if not self._tinypng_api_key():
             self._log("Ошибка: Укажите TinyPNG API key в настройках API.")
             return False
+        if len(self.upload_jpeg_files) > APP_SCREENSHOT_MAX_PER_SET:
+            self._log(
+                f"⚠️ Выбрано {len(self.upload_jpeg_files)} файлов. "
+                f"Apple допускает максимум {APP_SCREENSHOT_MAX_PER_SET} на локаль — лишние будут пропущены."
+            )
         return True
 
     def _on_metadata_upload_finished(self, success):
