@@ -675,7 +675,14 @@ class ASCClient:
             "version_string": attrs.get("versionString", ""),
             "state": attrs.get("appStoreState", ""),
             "platform": attrs.get("platform", ""),
+            "app_name": self.get_app_name(),
         }
+
+    def get_app_name(self):
+        data = self._request("GET", f"apps/{self.app_id}?fields[apps]=name")
+        if not data:
+            return ""
+        return data.get("data", {}).get("attributes", {}).get("name", "") or ""
 
     def list_apps(self):
         self.logger("Получение списка приложений App Store Connect...")
@@ -2678,6 +2685,8 @@ class MainWindow(QWidget):
         self.resize(self._initial_width, self._initial_height)
         self.setMinimumSize(1280, 820)
         self.variants_paths = {"Variant A": "", "Variant B": "", "Variant C": ""}
+        self._summary_app_name = ""
+        self._summary_app_version = ""
         self._setup_ui()
         self._apply_styles()
         self._apply_display_polish()
@@ -3379,9 +3388,12 @@ class MainWindow(QWidget):
             self.tinypng_key_input, self.gemini_key_input, self.gemini_model_input
         ]:
             widget.textChanged.connect(self._update_api_summary)
+        self.app_input.textChanged.connect(self._on_app_id_changed)
         self._update_api_summary()
         if self._has_complete_api_credentials():
             self.api_panel.setChecked(False)
+            if self.app_input.text().strip():
+                self._fetch_app_version(silent=True)
         self._refresh_variant_cards()
         self.tabs.currentChanged.connect(self._on_tab_change)
         self._on_tab_change(self.tabs.currentIndex())
@@ -3415,6 +3427,39 @@ class MainWindow(QWidget):
             self.p8_path_input.text().strip(),
         ])
 
+    def _api_summary_display_name(self):
+        if self._summary_app_name:
+            return self._summary_app_name.strip()
+        if hasattr(self, "meta_name_input"):
+            return self._line_text(self.meta_name_input)
+        return ""
+
+    def _api_summary_display_version(self):
+        if self._summary_app_version:
+            return self._summary_app_version.strip()
+        if hasattr(self, "meta_app_version_input"):
+            text = self.meta_app_version_input.text().strip()
+            if text and text != "—":
+                return text.split(" · ", 1)[0].strip()
+        return ""
+
+    def _format_api_summary_details(self, app_id):
+        parts = []
+        app_name = self._api_summary_display_name()
+        app_version = self._api_summary_display_version()
+        if app_name:
+            parts.append(app_name)
+        if app_version:
+            parts.append(f"v{app_version}" if not app_version.startswith("v") else app_version)
+        parts.append(f"App ID: {app_id}")
+        return " | ".join(parts)
+
+    def _on_app_id_changed(self):
+        self._summary_app_name = ""
+        self._summary_app_version = ""
+        if self._has_complete_api_credentials() and self.app_input.text().strip():
+            self._fetch_app_version(silent=True)
+
     def _update_api_summary(self):
         missing = []
         fields = [
@@ -3427,11 +3472,12 @@ class MainWindow(QWidget):
             if not value:
                 missing.append(field_name)
         app_id = self.app_input.text().strip() or "—"
+        details = self._format_api_summary_details(app_id)
         if missing:
-            summary = f"Не заполнено: {', '.join(missing)} | App ID: {app_id}"
+            summary = f"Не заполнено: {', '.join(missing)} | {details}"
             self.api_panel.set_summary(summary, status="warn")
         else:
-            summary = f"Готово к запуску | App ID: {app_id}"
+            summary = f"Готово к запуску | {details}"
             self.api_panel.set_summary(summary, status="ok")
 
     def _extract_key_id_from_p8_path(self):
@@ -4055,10 +4101,16 @@ class MainWindow(QWidget):
         version_string = version_info.get("version_string") or "—"
         state = version_info.get("state") or "unknown"
         version_id = version_info.get("id") or ""
+        app_name = version_info.get("app_name", "").strip()
+        if app_name:
+            self._summary_app_name = app_name
+        if version_string and version_string != "—":
+            self._summary_app_version = version_string
         label = f"{version_string} · {state}"
         if version_id:
             label += f" · {version_id}"
         self.meta_app_version_input.setText(label)
+        self._update_api_summary()
 
     def _app_lookup_creds(self):
         self._autofill_key_id_from_p8_path()
@@ -4165,7 +4217,10 @@ class MainWindow(QWidget):
         self.app_input.setText(app_id)
         name = app.get("name") or "приложение"
         bundle_id = app.get("bundle_id") or "bundle id не указан"
+        self._summary_app_name = name if name != "приложение" else ""
+        self._summary_app_version = ""
         self._save_env_to_file()
+        self._update_api_summary()
         self._log(f"APP_ID выбран: {app_id} ({name}, {bundle_id})")
         self._fetch_app_version(silent=True)
 
