@@ -325,6 +325,83 @@ APP_CATEGORY_OPTIONS = [
     ("6027", "Graphics & Design"),
 ]
 
+JIRA_METADATA_FIELDS = {
+    "privacy_policy_url": "customfield_10952",
+    "support_url": "customfield_11335",
+    "app_store_link": "customfield_10422",
+    "app_id": "customfield_10949",
+    "category": "customfield_12223",
+    "age": "customfield_12425",
+    "subtitle_white": "customfield_12218",
+    "keywords_white": "customfield_12288",
+    "subtitle_live": "customfield_12249",
+    "keywords_live": "customfield_12250",
+    "description_white": "customfield_12247",
+}
+
+JIRA_CATEGORY_VALUES = {
+    "6000": "App Business",
+    "6001": "App Weather",
+    "6002": "App Utilities",
+    "6003": "App Travel",
+    "6004": "App Sports",
+    "6005": "App Social Networking",
+    "6006": "App Reference",
+    "6007": "App Productivity",
+    "6008": "App Photo & Video",
+    "6009": "App News",
+    "6010": "App Navigation",
+    "6011": "App Music",
+    "6012": "App Lifestyle",
+    "6013": "App Health & Fitness",
+    "6014": "App Games",
+    "6015": "App Finance",
+    "6016": "App Entertainment",
+    "6017": "App Education",
+    "6018": "App Books",
+    "6020": "App Medical",
+    "6023": "App Food & Drink",
+    "6024": "App Shopping",
+    "6026": "App Developer Tools",
+    "6027": "App Graphics & Design",
+    "BUSINESS": "App Business",
+    "WEATHER": "App Weather",
+    "UTILITIES": "App Utilities",
+    "TRAVEL": "App Travel",
+    "SPORTS": "App Sports",
+    "SOCIAL_NETWORKING": "App Social Networking",
+    "REFERENCE": "App Reference",
+    "PRODUCTIVITY": "App Productivity",
+    "PHOTO_AND_VIDEO": "App Photo & Video",
+    "NEWS": "App News",
+    "NAVIGATION": "App Navigation",
+    "MUSIC": "App Music",
+    "LIFESTYLE": "App Lifestyle",
+    "HEALTH_AND_FITNESS": "App Health & Fitness",
+    "GAMES": "App Games",
+    "FINANCE": "App Finance",
+    "ENTERTAINMENT": "App Entertainment",
+    "EDUCATION": "App Education",
+    "BOOKS": "App Books",
+    "MEDICAL": "App Medical",
+    "FOOD_AND_DRINK": "App Food & Drink",
+    "SHOPPING": "App Shopping",
+    "DEVELOPER_TOOLS": "App Developer Tools",
+    "GRAPHICS_AND_DESIGN": "App Graphics & Design",
+}
+
+JIRA_AGE_VALUES = {
+    "": "+4",
+    "FIVE_AND_UNDER": "+4",
+    "SIX_TO_EIGHT": "+9",
+    "NINE_TO_ELEVEN": "+13",
+    "+4": "+4",
+    "+9": "+9",
+    "+13": "+13",
+    "+16": "+16",
+    "+18": "+18",
+}
+
 # iTunes genre ID (GUI) → App Store Connect API appCategories id
 ITUNES_GENRE_TO_APP_CATEGORY = {
     "6000": "BUSINESS",
@@ -1913,14 +1990,44 @@ class JiraWorker(QThread):
     success = Signal(str)
     error = Signal(str)
 
-    def __init__(self, base_url, email, api_token, project_key, issue_type, metadata):
+    def __init__(self, base_url, email, api_token, issue_key, metadata):
         super().__init__()
         self.base_url = base_url.rstrip("/")
         self.email = email
         self.api_token = api_token
-        self.project_key = project_key
-        self.issue_type = issue_type
+        self.issue_key = issue_key.strip().upper()
         self.metadata = metadata
+
+    def _select_value(self, value):
+        return {"value": value} if value else None
+
+    def _build_fields(self):
+        meta = self.metadata
+        fields = {}
+        text_fields = {
+            JIRA_METADATA_FIELDS["privacy_policy_url"]: meta.get("privacy_policy_url", ""),
+            JIRA_METADATA_FIELDS["support_url"]: meta.get("support_url", ""),
+            JIRA_METADATA_FIELDS["app_store_link"]: meta.get("app_store_link", ""),
+            JIRA_METADATA_FIELDS["app_id"]: meta.get("app_id", ""),
+            JIRA_METADATA_FIELDS["subtitle_white"]: meta.get("subtitle", ""),
+            JIRA_METADATA_FIELDS["keywords_white"]: meta.get("keywords", ""),
+            JIRA_METADATA_FIELDS["subtitle_live"]: meta.get("subtitle", ""),
+            JIRA_METADATA_FIELDS["keywords_live"]: meta.get("keywords", ""),
+            JIRA_METADATA_FIELDS["description_white"]: meta.get("description", ""),
+        }
+        for field_id, value in text_fields.items():
+            if value:
+                fields[field_id] = str(value)
+
+        category_value = meta.get("jira_category", "")
+        if category_value:
+            fields[JIRA_METADATA_FIELDS["category"]] = self._select_value(category_value)
+
+        age_value = meta.get("jira_age", "")
+        if age_value:
+            fields[JIRA_METADATA_FIELDS["age"]] = self._select_value(age_value)
+
+        return fields
 
     def run(self):
         import base64
@@ -1932,52 +2039,23 @@ class JiraWorker(QThread):
                 "Accept": "application/json"
             }
 
-            # Build ADF description
-            content = []
-            meta = self.metadata
-            fields = [
-                ("Description", meta.get("description", "")),
-                ("Subtitle", meta.get("subtitle", "")),
-                ("Keywords", meta.get("keywords", "")),
-                ("Support URL", meta.get("support_url", "")),
-                ("Privacy Policy URL", meta.get("privacy_policy_url", "")),
-                ("Category", meta.get("primary_category", "")),
-            ]
-            for label, value in fields:
-                if not value:
-                    continue
-                content.append({
-                    "type": "heading", "attrs": {"level": 2},
-                    "content": [{"type": "text", "text": label}]
-                })
-                content.append({
-                    "type": "paragraph",
-                    "content": [{"type": "text", "text": str(value)}]
-                })
+            fields = self._build_fields()
+            if not fields:
+                raise Exception("Нет заполненных метаданных для отправки в Jira.")
 
-            summary = f"[ASO] Metadata — {meta.get('app_name', '?')} — {meta.get('locale', '?')}"
-            payload = {
-                "fields": {
-                    "project": {"key": self.project_key},
-                    "issuetype": {"name": self.issue_type or "Story"},
-                    "summary": summary,
-                    "description": {"type": "doc", "version": 1, "content": content},
-                    "labels": ["aso", "metadata"]
-                }
-            }
-
-            self.log_msg.emit(f"Создаю Jira задачу в проекте {self.project_key}...")
-            resp = requests.post(
-                f"{self.base_url}/rest/api/3/issue",
-                headers=headers, json=payload, timeout=30
+            payload = {"fields": fields}
+            self.log_msg.emit(f"Обновляю Jira карточку {self.issue_key}...")
+            resp = requests.put(
+                f"{self.base_url}/rest/api/3/issue/{self.issue_key}",
+                headers=headers,
+                json=payload,
+                timeout=30
             )
             if not resp.ok:
                 raise Exception(f"Jira returned {resp.status_code}: {resp.text}")
 
-            data = resp.json()
-            issue_key = data.get("key", "?")
-            issue_url = f"{self.base_url}/browse/{issue_key}"
-            self.log_msg.emit(f"Задача создана: {issue_key}")
+            issue_url = f"{self.base_url}/browse/{self.issue_key}"
+            self.log_msg.emit(f"Карточка обновлена: {self.issue_key}")
             self.success.emit(issue_url)
 
         except Exception as e:
@@ -2935,13 +3013,19 @@ class MainWindow(QWidget):
         metadata_form_layout.addWidget(locale_group)
 
         jira_row = QHBoxLayout()
-        self.btn_create_jira = QPushButton("📋 Создать задачу в Jira")
+        self.jira_issue_key_input = QLineEdit(os.getenv("JIRA_ISSUE_KEY", ""))
+        self.jira_issue_key_input.setPlaceholderText("T7-1506")
+        self.jira_issue_key_input.setMaximumWidth(130)
+        self.jira_issue_key_input.editingFinished.connect(self._save_env_to_file)
+        self.btn_create_jira = QPushButton("📋 Обновить карточку Jira")
         self.btn_create_jira.setObjectName("start_btn")
         self.btn_create_jira.setMinimumHeight(42)
         self.btn_create_jira.setMinimumWidth(200)
-        self.btn_create_jira.clicked.connect(self._create_jira_issue)
-        jira_hint = QLabel("Экспортирует все заполненные метаданные (description, subtitle, keywords, URLs, category) в Jira Cloud")
+        self.btn_create_jira.clicked.connect(self._update_jira_issue)
+        jira_hint = QLabel("Записывает метаданные в существующую Jira карточку")
         jira_hint.setProperty("role", "hint")
+        jira_row.addWidget(QLabel("Issue:"))
+        jira_row.addWidget(self.jira_issue_key_input)
         jira_row.addWidget(self.btn_create_jira)
         jira_row.addWidget(jira_hint, stretch=1)
         metadata_form_layout.addLayout(jira_row)
@@ -4288,6 +4372,9 @@ class MainWindow(QWidget):
         return metadata_config
 
     def _collect_metadata_for_jira(self):
+        app_id = self.app_input.text().strip()
+        category_id = self._line_text(self.meta_primary_category_input)
+        age_raw = self._line_text(self.meta_kids_age_band_input)
         return {
             "app_name": self.meta_name_input.text().strip() or "—",
             "locale": self.meta_locale_combo.currentData() or "en-US",
@@ -4296,24 +4383,47 @@ class MainWindow(QWidget):
             "keywords": self._line_text(self.meta_keywords_input),
             "support_url": self._line_text(self.meta_support_url_input),
             "privacy_policy_url": self._line_text(self.meta_privacy_policy_url_input),
-            "primary_category": self.meta_primary_category_input.currentText(),
+            "app_id": app_id,
+            "app_store_link": f"https://apps.apple.com/app/id{app_id}" if app_id else "",
+            "primary_category": category_id,
+            "jira_category": self._jira_category_value(category_id, self.meta_primary_category_input.currentText()),
+            "jira_age": self._jira_age_value(age_raw),
         }
 
-    def _create_jira_issue(self):
+    def _jira_category_value(self, category_id, category_label):
+        raw = str(category_id or "").strip()
+        if raw in JIRA_CATEGORY_VALUES:
+            return JIRA_CATEGORY_VALUES[raw]
+
+        resolved = resolve_app_category_id(raw)
+        if resolved in JIRA_CATEGORY_VALUES:
+            return JIRA_CATEGORY_VALUES[resolved]
+
+        label = str(category_label or "").split("(", 1)[0].strip()
+        if not label or label == "Не выбрано":
+            return ""
+        if label.startswith(("App ", "Game ")):
+            return label
+        return f"App {label}"
+
+    def _jira_age_value(self, age_raw):
+        raw = str(age_raw or "").strip().upper()
+        return JIRA_AGE_VALUES.get(raw, raw if raw in {"+4", "+9", "+13", "+16", "+18"} else "")
+
+    def _update_jira_issue(self):
         base_url = self.jira_base_url_input.text().strip()
         email = self.jira_email_input.text().strip()
         api_token = self.jira_api_token_input.text().strip()
-        project_key = self.jira_project_key_input.text().strip()
-        issue_type = self.jira_issue_type_input.text().strip() or "Story"
+        issue_key = self.jira_issue_key_input.text().strip()
 
-        if not all([base_url, email, api_token, project_key]):
-            self._log("⚠️ Заполните Jira: Base URL, Email, API Token и Project Key в настройках API")
+        if not all([base_url, email, api_token, issue_key]):
+            self._log("⚠️ Заполните Jira: Base URL, Email, API Token и Issue в настройках API")
             return
 
         metadata = self._collect_metadata_for_jira()
         self.btn_create_jira.setEnabled(False)
-        self._log("Создаю задачу в Jira...")
-        self.jira_worker = JiraWorker(base_url, email, api_token, project_key, issue_type, metadata)
+        self._log(f"Обновляю Jira карточку {issue_key}...")
+        self.jira_worker = JiraWorker(base_url, email, api_token, issue_key, metadata)
         self.jira_worker.log_msg.connect(self._log)
         self.jira_worker.success.connect(self._on_jira_success)
         self.jira_worker.error.connect(lambda _: self.btn_create_jira.setEnabled(True))
@@ -4321,7 +4431,7 @@ class MainWindow(QWidget):
         self.jira_worker.start()
 
     def _on_jira_success(self, issue_url):
-        self._log(f"✅ Jira задача создана: {issue_url}")
+        self._log(f"✅ Jira карточка обновлена: {issue_url}")
         QDesktopServices.openUrl(QUrl(issue_url))
 
     def _check_length(self, label, text, limit, results):
@@ -4580,6 +4690,8 @@ class MainWindow(QWidget):
             env_content += f"JIRA_PROJECT_KEY={self.jira_project_key_input.text().strip()}\n"
         if hasattr(self, "jira_issue_type_input"):
             env_content += f"JIRA_ISSUE_TYPE={self.jira_issue_type_input.text().strip()}\n"
+        if hasattr(self, "jira_issue_key_input"):
+            env_content += f"JIRA_ISSUE_KEY={self.jira_issue_key_input.text().strip()}\n"
         try:
             with open(ENV_PATH, "w", encoding="utf-8") as f: f.write(env_content)
         except Exception as e:
