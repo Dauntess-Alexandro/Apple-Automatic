@@ -97,6 +97,50 @@ VERSION_LOCALIZATION_STATE_OPTIONAL = ("whatsNew", "promotionalText")
 APP_STORE_VERSION_STATE_OPTIONAL = ("copyright",)
 APP_INFO_LOCALIZATION_UNKNOWN = ("privacyPolicyText",)  # tvOS, не iOS
 
+AGE_RATING_DECLARATION_FREQUENCY_FIELDS = {
+    "alcoholTobaccoOrDrugUseOrReferences",
+    "contests",
+    "gamblingSimulated",
+    "gunsOrOtherWeapons",
+    "medicalOrTreatmentInformation",
+    "profanityOrCrudeHumor",
+    "sexualContentGraphicAndNudity",
+    "sexualContentOrNudity",
+    "horrorOrFearThemes",
+    "matureOrSuggestiveThemes",
+    "violenceCartoonOrFantasy",
+    "violenceRealisticProlongedGraphicOrSadistic",
+    "violenceRealistic",
+}
+AGE_RATING_DECLARATION_BOOLEAN_FIELDS = {
+    "advertising",
+    "gambling",
+    "healthOrWellnessTopics",
+    "lootBox",
+    "messagingAndChat",
+    "parentalControls",
+    "ageAssurance",
+    "unrestrictedWebAccess",
+    "userGeneratedContent",
+}
+AGE_RATING_DECLARATION_NULLABLE_FIELDS = {"kidsAgeBand", "developerAgeRatingInfoUrl"}
+AGE_RATING_DECLARATION_ALLOWED_FIELDS = (
+    AGE_RATING_DECLARATION_FREQUENCY_FIELDS
+    | AGE_RATING_DECLARATION_BOOLEAN_FIELDS
+    | AGE_RATING_DECLARATION_NULLABLE_FIELDS
+)
+
+
+def default_age_rating_declaration():
+    """Default ASC questionnaire answers: all capabilities No and all content None."""
+    attrs = {field: "NONE" for field in AGE_RATING_DECLARATION_FREQUENCY_FIELDS}
+    attrs.update({field: False for field in AGE_RATING_DECLARATION_BOOLEAN_FIELDS})
+    attrs["kidsAgeBand"] = None
+    return attrs
+
+
+DEFAULT_CONTENT_RIGHTS_DECLARATION = "DOES_NOT_USE_THIRD_PARTY_CONTENT"
+
 
 def normalize_review_phone(phone):
     """Формат Apple: +<код страны> <номер>, например +1 555 010 0611."""
@@ -204,7 +248,10 @@ def resolve_tinypng_api_key():
     )
 
 # Словарь: Код -> (Код_Флага, Понятное название)
-DEFAULT_GEMINI_PROMPT = """Описание:
+DEFAULT_GEMINI_PROMPT = """Language (mandatory):
+Always write ALL generated metadata in English, regardless of the app's primary locale, source language, or selected UI locale. Do not output Czech, Russian, or any other language unless the user explicitly asks for a different language.
+
+Description:
 Role:
 Act as a Senior Copywriter at a top-tier creative agency. Your goal is to write App Store copy that feels human, evocative, and entirely devoid of AI-speak or marketing clichés.
 
@@ -215,15 +262,15 @@ Style & Execution:
 Avoid these words: revolutionary, seamless, unlock, empower, unleash, ultimate, simple, solution, discover, master, stay organized.
 Use staccato and flow. Alternate punchy short sentences with longer descriptive ones.
 Use sensory details and specific real-world scenarios when relevant.
-No bullet points in the description. No dashes. English language.
+No bullet points in the description. No dashes. English only.
 
 Keywords:
 Act as a Senior ASO Specialist. Build a zero-waste keyword string under 100 characters including commas.
 Exclude words from the App Name and Subtitle. Avoid: best, top, easy, fast, free, app, simple.
-Use lowercase words separated only by commas. No dashes.
+Use lowercase English words separated only by commas. No dashes.
 
 Category:
-Recommend 1 Primary category and 1 Secondary category with a concise practical justification.
+Recommend 1 Primary category and 1 Secondary category with a concise practical justification in English.
 Base decisions only on features explicitly stated in the brief. Flag category risks honestly. No dashes.
 
 App Review notes:
@@ -248,6 +295,8 @@ TRANSLATION_FIELDS = [
     ("whatsNew", "What's New", 4000, "version"),
     ("subtitle", "Subtitle", 30, "app_info"),
 ]
+
+TRANSLATION_MAX_WORKERS = 6
 
 TRANSLATION_PROFILES = {
     "ASO natural": (
@@ -894,6 +943,30 @@ class ASCClient:
             payload["data"]["relationships"] = relationships
         self._request("PATCH", f"appInfos/{app_info_id}", payload)
 
+    def update_app(self, attributes):
+        payload = {
+            "data": {
+                "type": "apps",
+                "id": self.app_id,
+                "attributes": attributes
+            }
+        }
+        self._request("PATCH", f"apps/{self.app_id}", payload)
+
+    def get_age_rating_declaration(self, app_info_id):
+        data = self._request("GET", f"appInfos/{app_info_id}/ageRatingDeclaration")
+        return data.get("data") if data else None
+
+    def update_age_rating_declaration(self, declaration_id, attributes):
+        payload = {
+            "data": {
+                "type": "ageRatingDeclarations",
+                "id": declaration_id,
+                "attributes": attributes
+            }
+        }
+        self._request("PATCH", f"ageRatingDeclarations/{declaration_id}", payload)
+
     def get_app_review_detail(self, version_id):
         data = self._request("GET", f"appStoreVersions/{version_id}/appStoreReviewDetail")
         return data.get("data") if data else None
@@ -1208,6 +1281,31 @@ class MetadataWorker(QThread):
                 normalized.pop("kidsAgeBand", None)
         return {key: value for key, value in normalized.items() if key in allowed_fields and value not in (None, "")}
 
+    def _clean_age_rating_declaration(self, source):
+        attrs = {}
+        for key, value in dict(source or {}).items():
+            if key not in AGE_RATING_DECLARATION_ALLOWED_FIELDS:
+                self.log_msg.emit(f"⚠️ Age Ratings: неподдерживаемое поле '{key}' пропущено.")
+                continue
+            if key in AGE_RATING_DECLARATION_FREQUENCY_FIELDS:
+                normalized = str(value or "").strip().upper()
+                if normalized not in {"NONE", "INFREQUENT", "FREQUENT"}:
+                    self.log_msg.emit(
+                        f"⚠️ Age Ratings: '{key}'='{value}' неверно. Используйте NONE / INFREQUENT / FREQUENT."
+                    )
+                    continue
+                attrs[key] = normalized
+            elif key in AGE_RATING_DECLARATION_BOOLEAN_FIELDS:
+                if isinstance(value, bool):
+                    attrs[key] = value
+                elif isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+                    attrs[key] = value.strip().lower() == "true"
+                else:
+                    self.log_msg.emit(f"⚠️ Age Ratings: '{key}' должен быть true/false, поле пропущено.")
+            elif key in AGE_RATING_DECLARATION_NULLABLE_FIELDS:
+                attrs[key] = value if value not in ("", "null") else None
+        return attrs
+
     def run(self):
         try:
             self.progress_update.emit(0, "Подготовка метаданных...")
@@ -1228,6 +1326,8 @@ class MetadataWorker(QThread):
                 (1 if self.metadata_config.get("app_review_detail") else 0) +
                 (1 if self.metadata_config.get("availability_mode") else 0) +
                 (1 if "collects_data" in self.metadata_config else 0) +
+                (1 if self.metadata_config.get("age_rating_declaration") else 0) +
+                (1 if self.metadata_config.get("content_rights_declaration") else 0) +
                 len(self.metadata_config.get("custom_requests", []))
             )
             if total_tasks == 0:
@@ -1240,6 +1340,7 @@ class MetadataWorker(QThread):
                 self.progress_update.emit(percent, message)
 
             version_id = None
+            app_info_id = None
             version_localizations = self.metadata_config.get("version_localizations", [])
             include_whats_new = bool(self.metadata_config.get("include_whats_new", False))
             if version_localizations:
@@ -1298,7 +1399,7 @@ class MetadataWorker(QThread):
             app_info_localizations = self.metadata_config.get("app_info_localizations", [])
             app_info_payload = self.metadata_config.get("app_info")
             if app_info_localizations or app_info_payload:
-                app_info_id = client.get_app_info()
+                app_info_id = app_info_id or client.get_app_info()
 
                 if app_info_payload:
                     relationships = {}
@@ -1322,7 +1423,7 @@ class MetadataWorker(QThread):
                     if attributes or relationships:
                         try:
                             client.update_app_info(app_info_id, attributes or None, relationships or None)
-                            self.log_msg.emit("✅ Обновлены category/возрастные и другие appInfo-поля.")
+                            self.log_msg.emit("✅ Обновлены category/kidsAgeBand и другие appInfo-поля.")
                         except Exception as exc:
                             self.log_msg.emit(
                                 f"⚠️ app_info (категории/kidsAgeBand) не обновлены: {exc}. "
@@ -1363,6 +1464,28 @@ class MetadataWorker(QThread):
                             client.create_app_info_localization(app_info_id, locale, attributes)
                             self.log_msg.emit(f"✅ [{locale}] Создана app info-локализация.")
                         tick(f"Готово {locale}")
+
+            age_rating_declaration = self.metadata_config.get("age_rating_declaration")
+            if age_rating_declaration:
+                app_info_id = app_info_id or client.get_app_info()
+                declaration = client.get_age_rating_declaration(app_info_id)
+                if not declaration:
+                    raise Exception("Не найден Age Rating Declaration для приложения.")
+                attributes = self._clean_age_rating_declaration(age_rating_declaration)
+                if attributes:
+                    client.update_age_rating_declaration(declaration["id"], attributes)
+                    self.log_msg.emit("✅ Age Ratings обновлены: Step 1 = NO, content fields = NONE.")
+                else:
+                    self.log_msg.emit("⚠️ Age Ratings: нет валидных полей для обновления.")
+                tick("Готово Age Ratings")
+
+            content_rights_declaration = self.metadata_config.get("content_rights_declaration")
+            if content_rights_declaration:
+                client.update_app({
+                    "contentRightsDeclaration": content_rights_declaration
+                })
+                self.log_msg.emit("✅ Content Rights обновлены: third-party content = NO.")
+                tick("Готово Content Rights")
 
             app_store_version = self.metadata_config.get("app_store_version")
             if app_store_version:
@@ -1410,26 +1533,17 @@ class MetadataWorker(QThread):
 
             availability_mode = self.metadata_config.get("availability_mode")
             if availability_mode:
-                all_territory_ids = client.get_all_territory_ids()
-                if availability_mode == "SELECTED":
-                    selected_territory_ids = set(self.metadata_config.get("availability_territories", []))
-                    filtered_ids = [tid for tid in all_territory_ids if tid in selected_territory_ids]
-                    if not filtered_ids:
-                        raise Exception("Availability mode SELECTED: не выбрана ни одна страна.")
-                    client.set_app_available_territories(filtered_ids)
-                    self.log_msg.emit(f"✅ Availability обновлен: выбрано стран {len(filtered_ids)}.")
-                else:
-                    client.set_app_available_territories(all_territory_ids)
-                    self.log_msg.emit("✅ Availability обновлен: все страны (дефолт).")
+                self.log_msg.emit(
+                    "⚠️ Availability пропущен: App Store Connect больше не принимает "
+                    "обновление стран через этот API endpoint."
+                )
                 tick("Готово availability")
 
             if "collects_data" in self.metadata_config:
-                collects_data = bool(self.metadata_config.get("collects_data"))
-                if not collects_data:
-                    client.sync_app_privacy_details([], publish=True)
-                    self.log_msg.emit("✅ App Privacy: установлено «не собираем данные».")
-                else:
-                    self.log_msg.emit("ℹ️ App Privacy: режим «собираем данные», изменения не применялись автоматически.")
+                self.log_msg.emit(
+                    "⚠️ App Privacy пропущена: endpoint dataUsages больше не доступен "
+                    "через текущий App Store Connect API."
+                )
                 tick("Готово app privacy")
 
             for request_config in self.metadata_config.get("custom_requests", []):
@@ -1702,6 +1816,7 @@ class FetchTranslationAutoSourceWorker(QThread):
 
 class GeminiLocalizationTranslationWorker(QThread):
     log_msg = Signal(str)
+    progress_update = Signal(int, str)
     translations_ready = Signal(list)
     finished = Signal()
 
@@ -1737,59 +1852,83 @@ Source text:
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.2},
         }
-        response = requests.post(
-            endpoint,
-            headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
-            json=payload,
-            timeout=90,
-        )
-        response.raise_for_status()
+        response = None
+        for attempt in range(4):
+            response = requests.post(
+                endpoint,
+                headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
+                json=payload,
+                timeout=90,
+            )
+            if response.status_code not in (429, 500, 502, 503, 504):
+                response.raise_for_status()
+                break
+            if attempt == 3:
+                response.raise_for_status()
+            time.sleep(2 ** attempt)
         data = response.json()
         parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
         text = "".join(part.get("text", "") for part in parts).strip()
         return text
 
+    def _translate_task(self, locale, field_name, source_text):
+        if not source_text:
+            return {
+                "locale": locale,
+                "field": field_name,
+                "source": "",
+                "translation": "",
+                "status": "warn",
+                "warning": "Пустой source для поля",
+            }
+        try:
+            translated = self._translate_field(locale, field_name, source_text)
+            return {
+                "locale": locale,
+                "field": field_name,
+                "source": source_text,
+                "translation": translated,
+                "status": "ok" if translated else "warn",
+                "warning": "" if translated else "Пустой перевод",
+            }
+        except Exception as field_exc:
+            return {
+                "locale": locale,
+                "field": field_name,
+                "source": source_text,
+                "translation": "",
+                "status": "error",
+                "warning": f"Ошибка Gemini: {field_exc}",
+            }
+
     def run(self):
         rows = []
         try:
-            total = max(1, len(self.target_locales) * len(self.fields))
-            done = 0
+            tasks = []
             for locale in self.target_locales:
                 for field_name in self.fields:
                     source_text = str(self.source_payload.get(field_name, "") or "").strip()
-                    if not source_text:
-                        rows.append({
-                            "locale": locale,
-                            "field": field_name,
-                            "source": "",
-                            "translation": "",
-                            "status": "warn",
-                            "warning": "Пустой source для поля",
-                        })
-                        done += 1
-                        continue
-                    try:
-                        translated = self._translate_field(locale, field_name, source_text)
-                        rows.append({
-                            "locale": locale,
-                            "field": field_name,
-                            "source": source_text,
-                            "translation": translated,
-                            "status": "ok" if translated else "warn",
-                            "warning": "" if translated else "Пустой перевод",
-                        })
-                    except Exception as field_exc:
-                        rows.append({
-                            "locale": locale,
-                            "field": field_name,
-                            "source": source_text,
-                            "translation": "",
-                            "status": "error",
-                            "warning": f"Ошибка Gemini: {field_exc}",
-                        })
+                    tasks.append((locale, field_name, source_text))
+
+            total = max(1, len(tasks))
+            done = 0
+            max_workers = min(TRANSLATION_MAX_WORKERS, total)
+            self.log_msg.emit(f"Параллельный перевод: {total} задач, потоков: {max_workers}")
+            self.progress_update.emit(0, f"Перевод: 0/{total}")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_task = {
+                    executor.submit(self._translate_task, locale, field_name, source_text): (locale, field_name)
+                    for locale, field_name, source_text in tasks
+                }
+                for future in concurrent.futures.as_completed(future_to_task):
+                    locale, field_name = future_to_task[future]
+                    rows.append(future.result())
                     done += 1
                     self.log_msg.emit(f"Перевод {done}/{total}: {locale} · {field_name}")
+                    percent = int(done * 100 / total)
+                    self.progress_update.emit(percent, f"Перевод: {done}/{total}")
             self.translations_ready.emit(rows)
+            self.progress_update.emit(100, "Перевод завершен")
             self.log_msg.emit("✅ Перевод локализаций завершен.")
         except Exception as e:
             self.log_msg.emit(f"Ошибка перевода локализаций: {str(e)}")
@@ -1919,7 +2058,10 @@ class GeminiMetadataWorker(QThread):
                 "Fill all relevant keys for a complete metadata draft."
             )
             prompt = f"""
-Generate App Store metadata for locale {self.locale}.
+Generate App Store metadata.
+
+Output language: English only. Always write every generated text field in English, regardless of the app's primary locale, brief language, or target locale below.
+Target locale in App Store Connect (reference only, do NOT change output language): {self.locale}.
 Generation mode: {self.generation_mode}.
 Field focus: {field_hint}
 Current value to rewrite or shorten if relevant:
@@ -1950,6 +2092,7 @@ App brief / technical task:
 
 Hard safety rules:
 - Base claims only on the app brief.
+- All user-facing copy must be in English unless the user prompt explicitly requests another language.
 - Avoid unsupported privacy, medical, financial, login, subscription, tracking, or ads claims unless explicitly stated in the brief.
 - Never use em dashes or en dashes if the user prompt forbids dashes.
 - Keep keywords lowercase and comma-separated.
@@ -2008,6 +2151,17 @@ class JiraWorker(QThread):
     def _select_value(self, value):
         return {"value": value} if value else None
 
+    def _adf_doc(self, value):
+        content = []
+        for line in str(value).splitlines():
+            paragraph = {"type": "paragraph"}
+            if line:
+                paragraph["content"] = [{"type": "text", "text": line}]
+            content.append(paragraph)
+        if not content:
+            content.append({"type": "paragraph"})
+        return {"type": "doc", "version": 1, "content": content}
+
     def _build_fields(self):
         meta = self.metadata
         fields = {}
@@ -2020,11 +2174,14 @@ class JiraWorker(QThread):
             JIRA_METADATA_FIELDS["keywords_white"]: meta.get("keywords", ""),
             JIRA_METADATA_FIELDS["subtitle_live"]: meta.get("subtitle", ""),
             JIRA_METADATA_FIELDS["keywords_live"]: meta.get("keywords", ""),
-            JIRA_METADATA_FIELDS["description_white"]: meta.get("description", ""),
         }
         for field_id, value in text_fields.items():
             if value:
                 fields[field_id] = str(value)
+
+        description = meta.get("description", "")
+        if description:
+            fields[JIRA_METADATA_FIELDS["description_white"]] = self._adf_doc(description)
 
         category_value = meta.get("jira_category", "")
         if category_value:
@@ -2687,6 +2844,9 @@ class MainWindow(QWidget):
         self.variants_paths = {"Variant A": "", "Variant B": "", "Variant C": ""}
         self._summary_app_name = ""
         self._summary_app_version = ""
+        self.app_version_fetcher = None
+        self.metadata_fetcher = None
+        self.apps_fetcher = None
         self._setup_ui()
         self._apply_styles()
         self._apply_display_polish()
@@ -3219,7 +3379,7 @@ class MainWindow(QWidget):
         self.chain_screenshots_checkbox = QCheckBox(
             "После метаданных: TinyPNG → загрузка скринов (файлы и локали — вкладка «ЗАГРУЗКА СКРИНОВ»)"
         )
-        self.chain_screenshots_checkbox.setChecked(True)
+        self.chain_screenshots_checkbox.setChecked(False)
         metadata_form_layout.addWidget(self.chain_screenshots_checkbox)
 
         metadata_scroll.setWidget(metadata_widget)
@@ -3394,6 +3554,7 @@ class MainWindow(QWidget):
             self.api_panel.setChecked(False)
             if self.app_input.text().strip():
                 self._fetch_app_version(silent=True)
+                self._pull_metadata_from_apple()
         self._refresh_variant_cards()
         self.tabs.currentChanged.connect(self._on_tab_change)
         self._on_tab_change(self.tabs.currentIndex())
@@ -3795,21 +3956,61 @@ class MainWindow(QWidget):
             "p8_path": self.p8_path_input.text().strip()
         }
 
+    def _worker_is_running(self, attr_name):
+        worker = getattr(self, attr_name, None)
+        return worker is not None and worker.isRunning()
+
+    def _track_worker(self, attr_name, worker):
+        worker.setParent(self)
+        setattr(self, attr_name, worker)
+
+        def _cleanup():
+            current = getattr(self, attr_name, None)
+            if current is worker:
+                setattr(self, attr_name, None)
+            worker.deleteLater()
+
+        worker.finished.connect(_cleanup)
+
+    def _wait_for_workers(self, attr_names, timeout_ms=5000):
+        for attr_name in attr_names:
+            worker = getattr(self, attr_name, None)
+            if worker is not None and worker.isRunning():
+                worker.wait(timeout_ms)
+
+    def closeEvent(self, event):
+        self._wait_for_workers((
+            "app_version_fetcher",
+            "metadata_fetcher",
+            "apps_fetcher",
+            "worker",
+            "jira_worker",
+            "gemini_worker",
+            "screenshot_upload_worker",
+            "locale_refresh_worker",
+            "translation_upload_worker",
+            "translation_worker",
+        ))
+        super().closeEvent(event)
+
     def _pull_metadata_from_apple(self):
         self._save_env_to_file()
         api_creds = self._metadata_api_creds()
         if not all(api_creds.values()):
             self._log("Ошибка: Заполните все настройки API для Pull from Apple.")
             return
+        if self._worker_is_running("metadata_fetcher"):
+            return
 
         self.btn_pull_metadata.setEnabled(False)
         self.meta_source_locale_label.setText("Локаль: загрузка...")
         self.meta_source_version_label.setText("Версия: загрузка...")
-        self.metadata_fetcher = FetchMetadataSourceWorker(api_creds)
-        self.metadata_fetcher.log_msg.connect(self._log)
-        self.metadata_fetcher.source_fetched.connect(self._apply_metadata_source_payload)
-        self.metadata_fetcher.finished.connect(lambda: self.btn_pull_metadata.setEnabled(True))
-        self.metadata_fetcher.start()
+        metadata_fetcher = FetchMetadataSourceWorker(api_creds)
+        metadata_fetcher.log_msg.connect(self._log)
+        metadata_fetcher.source_fetched.connect(self._apply_metadata_source_payload)
+        metadata_fetcher.finished.connect(lambda: self.btn_pull_metadata.setEnabled(True))
+        self._track_worker("metadata_fetcher", metadata_fetcher)
+        metadata_fetcher.start()
 
     def _apply_metadata_source_payload(self, metadata_config):
         locale = metadata_config.get("source_locale")
@@ -3923,6 +4124,8 @@ class MainWindow(QWidget):
         source_locale = self.translation_source_locale_combo.currentData() or "en-US"
         profile = self.translation_profile_combo.currentText().strip() or "ASO natural"
         self._set_translation_buttons_enabled(False)
+        self.progress_bar.setValue(0)
+        self.time_label.setText("Перевод: 0%")
         self.translation_worker = GeminiLocalizationTranslationWorker(
             api_key=api_key,
             model=model,
@@ -3933,6 +4136,7 @@ class MainWindow(QWidget):
             source_payload=self.translation_source_payload,
         )
         self.translation_worker.log_msg.connect(self._log)
+        self.translation_worker.progress_update.connect(self._update_progress)
         self.translation_worker.translations_ready.connect(self._populate_translation_table)
         self.translation_worker.finished.connect(lambda: self._set_translation_buttons_enabled(True))
         self.translation_worker.start()
@@ -4087,15 +4291,19 @@ class MainWindow(QWidget):
                 self._log("Ошибка: Заполните Issuer ID, Key ID, APP_ID и .p8 для загрузки версии.")
             return
 
+        if self._worker_is_running("app_version_fetcher"):
+            return
+
         if hasattr(self, "btn_fetch_app_version"):
             self.btn_fetch_app_version.setEnabled(False)
-        self.app_version_fetcher = FetchAppVersionWorker(api_creds)
-        self.app_version_fetcher.log_msg.connect(self._log)
-        self.app_version_fetcher.version_fetched.connect(self._apply_app_version)
-        self.app_version_fetcher.finished.connect(
+        app_version_fetcher = FetchAppVersionWorker(api_creds)
+        app_version_fetcher.log_msg.connect(self._log)
+        app_version_fetcher.version_fetched.connect(self._apply_app_version)
+        app_version_fetcher.finished.connect(
             lambda: self.btn_fetch_app_version.setEnabled(True) if hasattr(self, "btn_fetch_app_version") else None
         )
-        self.app_version_fetcher.start()
+        self._track_worker("app_version_fetcher", app_version_fetcher)
+        app_version_fetcher.start()
 
     def _apply_app_version(self, version_info):
         version_string = version_info.get("version_string") or "—"
@@ -4130,13 +4338,17 @@ class MainWindow(QWidget):
             )
             return
 
+        if self._worker_is_running("apps_fetcher"):
+            return
+
         self.btn_fetch_app_id.setEnabled(False)
         self._log("Запрашиваю список приложений App Store Connect...")
-        self.apps_fetcher = FetchAppsWorker(creds)
-        self.apps_fetcher.log_msg.connect(self._log)
-        self.apps_fetcher.apps_fetched.connect(self._apply_fetched_apps)
-        self.apps_fetcher.finished.connect(lambda: self.btn_fetch_app_id.setEnabled(True))
-        self.apps_fetcher.start()
+        apps_fetcher = FetchAppsWorker(creds)
+        apps_fetcher.log_msg.connect(self._log)
+        apps_fetcher.apps_fetched.connect(self._apply_fetched_apps)
+        apps_fetcher.finished.connect(lambda: self.btn_fetch_app_id.setEnabled(True))
+        self._track_worker("apps_fetcher", apps_fetcher)
+        apps_fetcher.start()
 
     def _apply_fetched_apps(self, apps):
         if not apps:
@@ -4214,7 +4426,9 @@ class MainWindow(QWidget):
         if not app_id:
             self._log("Ошибка: выбранное приложение не содержит APP_ID.")
             return
+        self.app_input.blockSignals(True)
         self.app_input.setText(app_id)
+        self.app_input.blockSignals(False)
         name = app.get("name") or "приложение"
         bundle_id = app.get("bundle_id") or "bundle id не указан"
         self._summary_app_name = name if name != "приложение" else ""
@@ -4223,6 +4437,7 @@ class MainWindow(QWidget):
         self._update_api_summary()
         self._log(f"APP_ID выбран: {app_id} ({name}, {bundle_id})")
         self._fetch_app_version(silent=True)
+        self._pull_metadata_from_apple()
 
     def _load_metadata_json(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Выберите JSON с метаданными", "", "JSON Files (*.json);;All Files (*)")
@@ -4318,6 +4533,8 @@ class MainWindow(QWidget):
                 "secondaryCategory": "",
                 "kidsAgeBand": "FIVE_AND_UNDER"
             },
+            "age_rating_declaration": default_age_rating_declaration(),
+            "content_rights_declaration": DEFAULT_CONTENT_RIGHTS_DECLARATION,
             "availability_mode": "ALL",
             "availability_territories": [],
             "collects_data": False,
@@ -4372,7 +4589,6 @@ class MainWindow(QWidget):
             "secondaryCategory": self._line_text(self.meta_secondary_category_input),
             "kidsAgeBand": self._line_text(self.meta_kids_age_band_input)
         }
-        availability_mode = self.meta_availability_mode_input.currentData() or "ALL"
         valid_category_ids = {cat_id for cat_id, _ in APP_CATEGORY_OPTIONS if cat_id}
         valid_category_ids.update(ITUNES_GENRE_TO_APP_CATEGORY.values())
         for field in ("primaryCategory", "secondaryCategory"):
@@ -4414,10 +4630,8 @@ class MainWindow(QWidget):
             metadata_config["app_info_localizations"] = [app_info_item]
         if app_info:
             metadata_config["app_info"] = app_info
-        metadata_config["availability_mode"] = availability_mode
-        if availability_mode == "SELECTED":
-            metadata_config["availability_territories"] = self.meta_selected_territories
-        metadata_config["collects_data"] = self.meta_collects_data_checkbox.isChecked()
+        metadata_config["age_rating_declaration"] = default_age_rating_declaration()
+        metadata_config["content_rights_declaration"] = DEFAULT_CONTENT_RIGHTS_DECLARATION
         if app_store_version:
             metadata_config["app_store_version"] = app_store_version
         if app_review_detail:
@@ -4592,6 +4806,10 @@ class MainWindow(QWidget):
             results.append(
                 f"⚠️ kidsAgeBand '{kids_band}' неверный — используйте FIVE_AND_UNDER / SIX_TO_EIGHT / NINE_TO_ELEVEN"
             )
+        if metadata_config.get("age_rating_declaration"):
+            results.append("✅ Age Ratings будут отправлены: Step 1 = NO, остальные content-поля = NONE")
+        if metadata_config.get("content_rights_declaration") == DEFAULT_CONTENT_RIGHTS_DECLARATION:
+            results.append("✅ Content Rights будет отправлен: third-party content = NO")
         if not self.meta_include_whats_new_checkbox.isChecked():
             results.append("ℹ️ What's New не будет отправлен (первая версия / галочка выключена)")
 
@@ -5148,8 +5366,6 @@ class MainWindow(QWidget):
 
             if not metadata_config:
                 self._log("Ошибка: Заполните хотя бы одно поле метаданных.")
-                return
-            if self.chain_screenshots_checkbox.isChecked() and not self._validate_screenshot_upload_prereqs():
                 return
 
             self.start_btn.setEnabled(False)
