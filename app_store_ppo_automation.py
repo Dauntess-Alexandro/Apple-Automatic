@@ -2224,7 +2224,9 @@ class LocalizationUploadWorker(QThread):
             app_info_id = client.get_app_info()
             grouped = {}
             for row in self.rows:
-                if row.get("status") != "ok":
+                if not str(row.get("translation", "") or "").strip():
+                    continue
+                if row.get("status") == "error":
                     continue
                 locale = row.get("locale", "")
                 if not locale:
@@ -4449,6 +4451,12 @@ class MainWindow(QWidget):
         self.translation_table_busy = False
         self._validate_translation_table(preserve_existing_errors=True)
 
+    def _translation_row_uploadable(self, row):
+        translation = str(row.get("translation", "") or "").strip()
+        if not translation:
+            return False
+        return row.get("status") in ("ok", "info")
+
     def _status_for_row(self, field_key, translation_text):
         text = str(translation_text or "").strip()
         if not text:
@@ -4558,12 +4566,24 @@ class MainWindow(QWidget):
         if not rows:
             self._log("Нет данных для загрузки. Сначала выполните перевод.")
             return
-        ready_rows = [row for row in rows if row.get("status") == "ok"]
-        if not ready_rows:
-            self._log("Нет строк со статусом «готово». Исправьте ошибки и повторите validate.")
+        upload_rows = [row for row in rows if self._translation_row_uploadable(row)]
+        skipped_errors = sum(1 for row in rows if row.get("status") == "error")
+        skipped_empty = sum(1 for row in rows if row.get("status") == "warn")
+        if not upload_rows:
+            self._log(
+                "Нет строк для загрузки: нужен непустой перевод и статус без ошибки "
+                "(ошибка лимита / DeepL)."
+            )
             return
+        info_rows = sum(1 for row in upload_rows if row.get("status") == "info")
+        if info_rows:
+            self._log(f"ℹ️ {info_rows} строк с ASO-рекомендациями тоже будут загружены.")
+        if skipped_errors:
+            self._log(f"⚠️ Пропущено строк с ошибкой: {skipped_errors}.")
+        if skipped_empty:
+            self._log(f"⚠️ Пропущено пустых строк: {skipped_empty}.")
         self._set_translation_buttons_enabled(False)
-        self.translation_upload_worker = LocalizationUploadWorker(self._metadata_api_creds(), rows)
+        self.translation_upload_worker = LocalizationUploadWorker(self._metadata_api_creds(), upload_rows)
         self.translation_upload_worker.log_msg.connect(self._log)
         self.translation_upload_worker.progress_update.connect(self._update_progress)
         self.translation_upload_worker.upload_finished.connect(self._on_translation_upload_finished)
