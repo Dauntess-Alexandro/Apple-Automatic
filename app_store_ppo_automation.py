@@ -92,6 +92,83 @@ METADATA_FIELD_LIMITS = {
     "notes": 4000,
 }
 
+
+KEYWORD_PART_SPLIT_RE = re.compile(r"[,،;؛\n]+")
+KEYWORD_INLINE_WORD_SPLIT_RE = re.compile(r"[\s\u00a0\u200b\u200c\u200d\ufeff]+")
+
+
+def _split_keyword_parts(text):
+    """Keywords: латиница/кириллица через запятую; арабский часто через пробел или ،"""
+    text = str(text or "").strip()
+    if not text:
+        return []
+    if KEYWORD_PART_SPLIT_RE.search(text):
+        return [part.strip() for part in KEYWORD_PART_SPLIT_RE.split(text) if part.strip()]
+    return [word for word in KEYWORD_INLINE_WORD_SPLIT_RE.split(text) if word]
+
+
+def _join_keyword_parts(parts):
+    return ",".join(parts)
+
+
+def truncate_keywords_to_limit(text, limit=100):
+    """Убирает целые keywords с конца (запятая/пробел), не режет посередине слова."""
+    text = str(text or "").strip()
+    if not text or len(text) <= limit:
+        return text, False
+    parts = _split_keyword_parts(text)
+    if not parts:
+        return text, False
+
+    original = text
+    while len(parts) > 1 and len(_join_keyword_parts(parts)) > limit:
+        parts.pop()
+
+    result = _join_keyword_parts(parts)
+    if len(result) <= limit:
+        return result, result != original
+
+    while parts and len(_join_keyword_parts(parts)) > limit:
+        last = parts[-1]
+        subwords = [word for word in KEYWORD_INLINE_WORD_SPLIT_RE.split(last) if word]
+        if len(subwords) > 1:
+            subwords.pop()
+            parts[-1] = " ".join(subwords)
+        else:
+            parts.pop()
+
+    result = _join_keyword_parts(parts)
+    return result, result != original
+
+
+def truncate_text_by_words(text, limit):
+    """Убирает целые слова с конца (пробелы), не режет посередине слова."""
+    text = str(text or "").strip()
+    if not text or len(text) <= limit:
+        return text, False
+    words = text.split()
+    if not words:
+        return text, False
+    while len(words) > 1:
+        candidate = " ".join(words)
+        if len(candidate) <= limit:
+            return candidate, candidate != text
+        words.pop()
+    return words[0] if len(words[0]) <= limit else words[0], True
+
+
+def truncate_metadata_field(field_key, text, limits_map=None):
+    limits_map = limits_map or METADATA_FIELD_LIMITS
+    limit = limits_map.get(field_key)
+    if not limit or not isinstance(text, str):
+        return text, False
+    text = text.strip()
+    if len(text) <= limit:
+        return text, False
+    if field_key == "keywords":
+        return truncate_keywords_to_limit(text, limit)
+    return truncate_text_by_words(text, limit)
+
 # Поля version localization, которые Apple может отклонить по статусу версии
 VERSION_LOCALIZATION_STATE_OPTIONAL = ("whatsNew", "promotionalText")
 APP_STORE_VERSION_STATE_OPTIONAL = ("copyright",)
@@ -207,9 +284,13 @@ def apply_metadata_field_limits(attributes, limits_map, logger=None):
             continue
         if key in limits_map and isinstance(value, str) and len(value) > limits_map[key]:
             limit = limits_map[key]
+            trimmed, _changed = truncate_metadata_field(key, value, limits_map)
             if logger:
-                logger(f"⚠️ {key}: обрезано {len(value)} → {limit} символов")
-            result[key] = value[:limit]
+                logger(
+                    f"⚠️ {key}: сокращено {len(value)} → {len(trimmed)} символов "
+                    f"(лимит {limit}, целые слова с конца)"
+                )
+            result[key] = trimmed
         else:
             result[key] = value
     return result
@@ -400,6 +481,10 @@ TRANSLATION_STATUS_COLORS = {
 }
 
 APP_SCREENSHOT_MAX_PER_SET = 10
+VERSION_URL_ATTRIBUTE_KEYS = ("supportUrl", "marketingUrl")
+SCREENSHOT_UPLOAD_MAX_WORKERS = 4
+API_REQUEST_MAX_RETRIES = 6
+SCREENSHOT_FILE_UPLOAD_RETRIES = 4
 
 APP_CATEGORY_OPTIONS = [
     ("", "Не выбрано"),
@@ -442,7 +527,12 @@ JIRA_METADATA_FIELDS = {
     "subtitle_live": "customfield_12249",
     "keywords_live": "customfield_12250",
     "description_white": "customfield_12247",
+    "design_metadata": "customfield_12220",
+    "codemagic_account": "customfield_12221",
 }
+
+JIRA_DESIGN_METADATA_VALUE = "TinyPNG"
+JIRA_CODEMAGIC_ACCOUNT_VALUE = "alexandr7"
 
 JIRA_CATEGORY_VALUES = {
     "6000": "App Business",
@@ -693,6 +783,48 @@ class TinyPngCompressor:
             except OSError:
                 pass
 
+def _is_transient_network_error(exc):
+    """SSL обрывы, reset соединения и таймауты — повторяем запрос."""
+    if isinstance(
+        exc,
+        (
+            requests.exceptions.SSLError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        ),
+    ):
+        return True
+    cause = exc
+    while cause is not None:
+        if isinstance(cause, ConnectionResetError):
+            return True
+        if isinstance(cause, OSError) and getattr(cause, "winerror", None) == 10054:
+            return True
+        cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "unexpected_eof",
+            "connection aborted",
+            "connection reset",
+            "remotedisconnected",
+            "broken pipe",
+        )
+    )
+
+
+def _is_retriable_screenshot_upload_error(exc):
+    """Сетевой сбой / исчерпаны внутренние retry _request — можно повторить upload целиком."""
+    return (
+        isinstance(exc, requests.exceptions.RequestException)
+        and _is_transient_network_error(exc)
+    ) or (
+        isinstance(exc, Exception) and str(exc).startswith("API Request failed:")
+    )
+
+
 class ASCClient:
     def __init__(self, issuer_id, key_id, private_key_path, app_id, logger_callback):
         self.issuer_id = issuer_id
@@ -723,8 +855,8 @@ class ASCClient:
         }
         return jwt.encode(payload, self.private_key, algorithm="ES256", headers=headers)
 
-    # Умная функция запроса с защитой от лимитов Apple
-    def _request(self, method, endpoint, payload=None, max_retries=4):
+    # Умная функция запроса с защитой от лимитов Apple и повтором при обрыве сети
+    def _request(self, method, endpoint, payload=None, max_retries=API_REQUEST_MAX_RETRIES):
         url = f"{self.base_url}/{endpoint}"
         
         for attempt in range(max_retries):
@@ -735,13 +867,13 @@ class ASCClient:
             }
             try:
                 if method == "GET":
-                    response = requests.get(url, headers=headers)
+                    response = requests.get(url, headers=headers, timeout=120)
                 elif method == "POST":
-                    response = requests.post(url, headers=headers, json=payload)
+                    response = requests.post(url, headers=headers, json=payload, timeout=120)
                 elif method == "PATCH":
-                    response = requests.patch(url, headers=headers, json=payload)
+                    response = requests.patch(url, headers=headers, json=payload, timeout=120)
                 elif method == "DELETE":
-                    response = requests.delete(url, headers=headers)
+                    response = requests.delete(url, headers=headers, timeout=120)
                     response.raise_for_status()
                     return {} 
                 else:
@@ -751,12 +883,21 @@ class ASCClient:
                 return response.json()
                 
             except requests.exceptions.RequestException as e:
-                # Если сервер просит притормозить (ошибка 429 или 502/503)
+                retryable = False
                 if e.response is not None and e.response.status_code in [429, 502, 503]:
-                    if attempt < max_retries - 1:
-                        sleep_time = 2 ** attempt # Экспоненциальная пауза: 1 сек, 2 сек, 4 сек
-                        time.sleep(sleep_time)
-                        continue
+                    retryable = True
+                elif _is_transient_network_error(e):
+                    retryable = True
+
+                if retryable and attempt < max_retries - 1:
+                    sleep_time = min(2 ** attempt, 10)
+                    if _is_transient_network_error(e):
+                        self.logger(
+                            f"⚠️ Сетевая ошибка ({endpoint.split('/')[0]}), "
+                            f"повтор {attempt + 2}/{max_retries} через {sleep_time} с..."
+                        )
+                    time.sleep(sleep_time)
+                    continue
                         
                 err_msg = str(e)
                 if e.response is not None:
@@ -946,11 +1087,65 @@ class ASCClient:
             APP_INFO_LOCALIZATION_UNKNOWN,
         )
 
-    def ensure_version_localization(self, version_id, locale):
+    def resolve_version_url_defaults(self, version_id, overrides=None):
+        """Support/Marketing URL: GUI → primary locale → любая локаль с заполненными URL."""
+        overrides = overrides or {}
+        picked = {}
+        for key in VERSION_URL_ATTRIBUTE_KEYS:
+            val = str(overrides.get(key, "") or "").strip()
+            if val:
+                picked[key] = val
+        if len(picked) == len(VERSION_URL_ATTRIBUTE_KEYS):
+            return sanitize_metadata_urls(picked)
+
+        records = self.get_version_localization_records(version_id)
+        primary_locale = None
+        try:
+            primary_locale = self.get_app_primary_locale()
+        except Exception:
+            pass
+
+        ordered = []
+        if primary_locale:
+            ordered.extend(
+                r for r in records if r.get("attributes", {}).get("locale") == primary_locale
+            )
+        ordered.extend(
+            r for r in records if not primary_locale or r.get("attributes", {}).get("locale") != primary_locale
+        )
+        for record in ordered:
+            attrs = record.get("attributes", {}) or {}
+            for key in VERSION_URL_ATTRIBUTE_KEYS:
+                if key in picked:
+                    continue
+                val = str(attrs.get(key, "") or "").strip()
+                if val:
+                    picked[key] = val
+        return sanitize_metadata_urls(picked)
+
+    def ensure_version_localization(self, version_id, locale, url_defaults=None):
+        defaults = self.resolve_version_url_defaults(version_id, url_defaults)
         existing = self.get_version_localization_by_locale(version_id, locale)
         if existing:
-            return existing["id"], False
-        created_id = self.create_version_localization(version_id, locale, {})
+            loc_id = existing["id"]
+            attrs = existing.get("attributes", {}) or {}
+            patch = {}
+            for key in VERSION_URL_ATTRIBUTE_KEYS:
+                if defaults.get(key) and not str(attrs.get(key, "") or "").strip():
+                    patch[key] = defaults[key]
+            if patch:
+                patch = sanitize_version_localization_attributes(patch, self.logger)
+                if patch:
+                    self.update_version_localization(loc_id, patch)
+                    self.logger(
+                        f"[{locale}] Подтянуты URL: {', '.join(patch.keys())}."
+                    )
+            return loc_id, False
+
+        create_attrs = sanitize_version_localization_attributes(defaults, self.logger) if defaults else {}
+        created_id = self.create_version_localization(version_id, locale, create_attrs)
+        if create_attrs:
+            self.logger(f"[{locale}] Локаль создана с support/marketing URL.")
         return created_id, True
 
     def ensure_app_info_localization(self, app_info_id, locale):
@@ -1279,15 +1474,23 @@ class ASCClient:
                 f.seek(offset)
                 chunk = f.read(length)
                 
-                # Здесь тоже может быть сетевая ошибка, добавляем простые попытки
-                for attempt in range(3):
+                for attempt in range(SCREENSHOT_FILE_UPLOAD_RETRIES):
                     try:
-                        req = requests.put(operation["url"], headers=headers, data=chunk)
+                        req = requests.put(
+                            operation["url"], headers=headers, data=chunk, timeout=180
+                        )
                         req.raise_for_status()
                         break
-                    except requests.exceptions.RequestException:
-                        if attempt == 2: raise
-                        time.sleep(1)
+                    except requests.exceptions.RequestException as exc:
+                        if attempt >= SCREENSHOT_FILE_UPLOAD_RETRIES - 1:
+                            raise
+                        if _is_transient_network_error(exc) or (
+                            exc.response is not None
+                            and exc.response.status_code in [429, 502, 503]
+                        ):
+                            time.sleep(min(2 ** attempt, 8))
+                            continue
+                        raise
 
         commit_payload = {
             "data": {
@@ -2205,10 +2408,11 @@ class LocalizationUploadWorker(QThread):
     upload_finished = Signal(dict)
     finished = Signal()
 
-    def __init__(self, api_creds, rows):
+    def __init__(self, api_creds, rows, version_url_defaults=None):
         super().__init__()
         self.api_creds = api_creds
         self.rows = rows
+        self.version_url_defaults = version_url_defaults or {}
 
     def run(self):
         summary = {"locales": 0, "fields": 0, "errors": 0}
@@ -2222,6 +2426,14 @@ class LocalizationUploadWorker(QThread):
             )
             version_id = client.get_latest_app_store_version()
             app_info_id = client.get_app_info()
+            url_defaults = client.resolve_version_url_defaults(
+                version_id, self.version_url_defaults
+            )
+            if url_defaults:
+                self.log_msg.emit(
+                    "URL для новых локалей: "
+                    + ", ".join(f"{k}={v}" for k, v in url_defaults.items())
+                )
             grouped = {}
             for row in self.rows:
                 if not str(row.get("translation", "") or "").strip():
@@ -2245,7 +2457,9 @@ class LocalizationUploadWorker(QThread):
             for locale, payloads in grouped.items():
                 try:
                     if payloads["version"]:
-                        loc_id, created = client.ensure_version_localization(version_id, locale)
+                        loc_id, created = client.ensure_version_localization(
+                            version_id, locale, url_defaults
+                        )
                         attrs = sanitize_version_localization_attributes(payloads["version"], self.log_msg.emit)
                         if attrs:
                             client.update_version_localization(loc_id, attrs)
@@ -2456,6 +2670,9 @@ class JiraWorker(QThread):
         if age_value:
             fields[JIRA_METADATA_FIELDS["age"]] = self._select_value(age_value)
 
+        fields[JIRA_METADATA_FIELDS["design_metadata"]] = self._select_value(JIRA_DESIGN_METADATA_VALUE)
+        fields[JIRA_METADATA_FIELDS["codemagic_account"]] = JIRA_CODEMAGIC_ACCOUNT_VALUE
+
         return fields
 
     def run(self):
@@ -2647,13 +2864,25 @@ class AutomationWorker(QThread):
                 self.finished.emit()
                 return
 
+            tinypng = TinyPngCompressor(self.tinypng_api_key, self.log_msg.emit)
+            if tinypng.enabled:
+                self.log_msg.emit("TinyPNG: сжатие скринов перед загрузкой (как на вкладке «Загрузка скринов»)...")
+                seen_paths = set()
+                prep_paths = []
+                for task in upload_tasks:
+                    for filename in task["files"]:
+                        fp = os.path.normpath(os.path.join(task["folder"], filename))
+                        if fp not in seen_paths:
+                            seen_paths.add(fp)
+                            prep_paths.append(fp)
+                for i, fp in enumerate(prep_paths, start=1):
+                    self.log_msg.emit(f"TinyPNG: подготовка {i}/{len(prep_paths)} — {os.path.basename(fp)}")
+                    tinypng.compress(fp)
+
             total_tasks = sum([1 + len(task["files"]) for task in upload_tasks])
             completed_tasks = 0
             start_time = time.time()
             progress_lock = threading.Lock() # Блокировка для безопасного обновления прогресса
-            tinypng = TinyPngCompressor(self.tinypng_api_key, self.log_msg.emit)
-            if tinypng.enabled:
-                self.log_msg.emit("TinyPNG: сжатие скринов перед загрузкой в App Store Connect...")
 
             def tick():
                 nonlocal completed_tasks
@@ -2671,32 +2900,68 @@ class AutomationWorker(QThread):
                 friendly_name = LOCALE_MAP.get(task['locale'], ("", task['locale']))[1]
                 self.log_msg.emit(f"[{task['variant']} | {friendly_name}] Запуск обработки...")
                 
-                sets = client.get_screenshot_sets(task['loc_id'])
-                target_set_id = None
-                
-                for s in sets:
-                    if s["attributes"]["screenshotDisplayType"] == "APP_IPHONE_67":
-                        target_set_id = s["id"]
-                    for old_sc in client.get_screenshots(s["id"]):
-                        client.delete_screenshot(old_sc["id"])
-                        
-                if not target_set_id:
-                    target_set_id = client.create_screenshot_set(task['loc_id'], "APP_IPHONE_67")
-                tick() # Тик после создания сета/очистки
+                def prepare_screenshot_set():
+                    sets = client.get_screenshot_sets(task['loc_id'])
+                    target_set_id = None
+                    for s in sets:
+                        if s["attributes"]["screenshotDisplayType"] == "APP_IPHONE_67":
+                            target_set_id = s["id"]
+                        for old_sc in client.get_screenshots(s["id"]):
+                            client.delete_screenshot(old_sc["id"])
+                    if not target_set_id:
+                        target_set_id = client.create_screenshot_set(task['loc_id'], "APP_IPHONE_67")
+                    return target_set_id
+
+                for attempt in range(SCREENSHOT_FILE_UPLOAD_RETRIES):
+                    try:
+                        target_set_id = prepare_screenshot_set()
+                        break
+                    except Exception as exc:
+                        if not _is_retriable_screenshot_upload_error(exc) or attempt >= SCREENSHOT_FILE_UPLOAD_RETRIES - 1:
+                            raise
+                        wait = min(2 ** attempt, 8)
+                        self.log_msg.emit(
+                            f"[{task['variant']} | {friendly_name}] "
+                            f"⚠️ Ошибка подготовки набора скринов, "
+                            f"повтор {attempt + 2}/{SCREENSHOT_FILE_UPLOAD_RETRIES} через {wait} с..."
+                        )
+                        time.sleep(wait)
+                tick()
 
                 for index, filename in enumerate(task['files'], start=1):
-                    filepath = os.path.join(task['folder'], filename)
+                    filepath = os.path.normpath(os.path.join(task['folder'], filename))
                     ext = os.path.splitext(filename)[1].lower() 
                     new_filename = f"{index}{ext}"
                     upload_path = tinypng.compress(filepath)
-                    client.upload_screenshot(target_set_id, upload_path, new_filename)
-                    tick() # Тик после загрузки файла
+                    self.log_msg.emit(
+                        f"[{task['variant']} | {friendly_name}] Upload {index}/{len(task['files'])}: {new_filename}"
+                    )
+                    for attempt in range(SCREENSHOT_FILE_UPLOAD_RETRIES):
+                        try:
+                            client.upload_screenshot(target_set_id, upload_path, new_filename)
+                            break
+                        except Exception as exc:
+                            if (
+                                not _is_retriable_screenshot_upload_error(exc)
+                                or attempt >= SCREENSHOT_FILE_UPLOAD_RETRIES - 1
+                            ):
+                                raise
+                            wait = min(2 ** attempt, 8)
+                            self.log_msg.emit(
+                                f"[{task['variant']} | {friendly_name}] "
+                                f"⚠️ Ошибка загрузки {new_filename}, "
+                                f"повтор {attempt + 2}/{SCREENSHOT_FILE_UPLOAD_RETRIES} через {wait} с..."
+                            )
+                            time.sleep(wait)
+                    tick()
 
-            self.log_msg.emit(f"Начинаем многопоточную загрузку ({len(upload_tasks)} локалей)...")
+            max_workers = min(SCREENSHOT_UPLOAD_MAX_WORKERS, max(1, len(upload_tasks)))
+            self.log_msg.emit(
+                f"Начинаем многопоточную загрузку ({len(upload_tasks)} задач), потоков: {max_workers}."
+            )
             
-            # Запускаем пул потоков (5 параллельных загрузок)
             try:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = [executor.submit(upload_worker, t) for t in upload_tasks]
                     
                     # Ожидаем завершения всех потоков и отлавливаем ошибки
@@ -2747,12 +3012,13 @@ class ScreenshotUploadWorker(QThread):
     progress_update = Signal(int, str)
     finished = Signal()
 
-    def __init__(self, api_creds, target_locales, jpeg_files, tinypng_api_key=""):
+    def __init__(self, api_creds, target_locales, jpeg_files, tinypng_api_key="", version_url_defaults=None):
         super().__init__()
         self.api_creds = api_creds
         self.target_locales = target_locales
         self.jpeg_files = jpeg_files
         self.tinypng_api_key = tinypng_api_key
+        self.version_url_defaults = version_url_defaults or {}
 
     def run(self):
         tinypng = None
@@ -2769,6 +3035,14 @@ class ScreenshotUploadWorker(QThread):
                 self.api_creds["p8_path"], self.api_creds["app_id"], self.log_msg.emit
             )
             version_id = client.get_latest_app_store_version()
+            url_defaults = client.resolve_version_url_defaults(
+                version_id, self.version_url_defaults
+            )
+            if url_defaults:
+                self.log_msg.emit(
+                    "URL для новых локалей (скрины): "
+                    + ", ".join(f"{k}={v}" for k, v in url_defaults.items())
+                )
             records = client.get_version_localization_records(version_id)
             loc_to_id = {item["attributes"]["locale"]: item["id"] for item in records if item.get("attributes", {}).get("locale")}
             total_steps = max(1, len(self.target_locales) * len(self.jpeg_files))
@@ -2789,12 +3063,12 @@ class ScreenshotUploadWorker(QThread):
                     self.api_creds["p8_path"], self.api_creds["app_id"], self.log_msg.emit
                 )
                 with locales_lock:
-                    localization_id = loc_to_id.get(locale)
-                    if not localization_id:
-                        self.log_msg.emit(f"[{locale}] Локаль не открыта, создаем...")
-                        localization_id = local_client.create_version_localization(version_id, locale, {})
-                        loc_to_id[locale] = localization_id
-                        time.sleep(0.5)
+                    self.log_msg.emit(f"[{locale}] Проверка version-локали и URL...")
+                    localization_id, _created = local_client.ensure_version_localization(
+                        version_id, locale, url_defaults
+                    )
+                    loc_to_id[locale] = localization_id
+                    time.sleep(0.5)
                 self.log_msg.emit(f"[{locale}] Подготовка screenshot set APP_IPHONE_67...")
                 sets = local_client._request("GET", f"appStoreVersionLocalizations/{localization_id}/appScreenshotSets").get("data", [])
                 target_set = next((s for s in sets if s.get("attributes", {}).get("screenshotDisplayType") == "APP_IPHONE_67"), None)
@@ -2828,11 +3102,24 @@ class ScreenshotUploadWorker(QThread):
                 for idx, file_path in enumerate(files_to_upload, start=1):
                     file_name = f"{idx}_{os.path.basename(self.jpeg_files[idx - 1])}"
                     self.log_msg.emit(f"[{locale}] Upload {idx}/{len(files_to_upload)}: {file_name}")
-                    local_client.upload_screenshot(target_set_id, file_path, file_name)
+                    for attempt in range(SCREENSHOT_FILE_UPLOAD_RETRIES):
+                        try:
+                            local_client.upload_screenshot(target_set_id, file_path, file_name)
+                            break
+                        except Exception as exc:
+                            transient = _is_retriable_screenshot_upload_error(exc)
+                            if not transient or attempt >= SCREENSHOT_FILE_UPLOAD_RETRIES - 1:
+                                raise
+                            wait = min(2 ** attempt, 8)
+                            self.log_msg.emit(
+                                f"[{locale}] ⚠️ Ошибка загрузки {file_name}, "
+                                f"повтор {attempt + 2}/{SCREENSHOT_FILE_UPLOAD_RETRIES} через {wait} с..."
+                            )
+                            time.sleep(wait)
                     tick()
                     time.sleep(1)
 
-            max_workers = min(5, max(1, len(self.target_locales)))
+            max_workers = min(SCREENSHOT_UPLOAD_MAX_WORKERS, max(1, len(self.target_locales)))
             self.log_msg.emit(f"Запускаем параллельную загрузку скринов: потоков {max_workers}.")
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [executor.submit(upload_locale, locale) for locale in self.target_locales]
@@ -4242,6 +4529,12 @@ class MainWindow(QWidget):
             "p8_path": self.p8_path_input.text().strip()
         }
 
+    def _version_url_defaults_from_gui(self):
+        return {
+            "supportUrl": self._line_text(self.meta_support_url_input),
+            "marketingUrl": self._line_text(self.meta_marketing_url_input),
+        }
+
     def _worker_is_running(self, attr_name):
         worker = getattr(self, attr_name, None)
         return worker is not None and worker.isRunning()
@@ -4465,9 +4758,9 @@ class MainWindow(QWidget):
         if limit and len(text) > limit:
             return "error", f"Превышен лимит {len(text)}/{limit}"
         if field_key == "keywords":
-            if " " in text:
-                return "info", "Keywords: лучше без пробелов"
-            items = [v.strip().lower() for v in text.split(",") if v.strip()]
+            if KEYWORD_INLINE_WORD_SPLIT_RE.search(text) and not KEYWORD_PART_SPLIT_RE.search(text):
+                return "info", "Keywords: лучше comma-separated (без пробелов)"
+            items = [v.strip().lower() for v in _split_keyword_parts(text)]
             duplicates = sorted({v for v in items if items.count(v) > 1})
             if duplicates:
                 return "info", f"Дубли keywords: {', '.join(duplicates)}"
@@ -4502,6 +4795,7 @@ class MainWindow(QWidget):
 
     def _validate_translation_table(self, preserve_existing_errors=False):
         self.translation_table_busy = True
+        trimmed_rows = 0
         for row_idx in range(self.translation_table.rowCount()):
             field_item = self.translation_table.item(row_idx, 1)
             translation_item = self.translation_table.item(row_idx, 3)
@@ -4509,19 +4803,39 @@ class MainWindow(QWidget):
             warning_item = self.translation_table.item(row_idx, 5)
             if field_item is None or translation_item is None:
                 continue
+            warning_text = warning_item.text().strip() if warning_item is not None else ""
+            is_limit_error = warning_text.startswith("Превышен лимит")
             if (
                 preserve_existing_errors
                 and status_item is not None
-                and warning_item is not None
                 and status_item.text().strip().lower() in {"error", "ошибка"}
-                and warning_item.text().strip()
+                and warning_text
+                and not is_limit_error
             ):
-                self._apply_row_status_style(row_idx, "error", warning_item.text().strip())
+                self._apply_row_status_style(row_idx, "error", warning_text)
                 continue
             field_key = field_item.data(Qt.UserRole) or field_item.text().strip()
+            original = translation_item.text()
+            trimmed, changed = truncate_metadata_field(field_key, original)
+            if changed:
+                translation_item.setText(trimmed)
+                trimmed_rows += 1
             status, warning = self._status_for_row(field_key, translation_item.text())
+            if changed:
+                limit = self._field_limit(field_key) or len(trimmed)
+                warning = (
+                    f"Авто-сокращено {len(original)}→{len(trimmed)} "
+                    f"(лимит {limit}, целые слова с конца). {warning}"
+                )
+                if status == "error":
+                    status = "info"
             self._apply_row_status_style(row_idx, status, warning)
         self.translation_table_busy = False
+        if trimmed_rows:
+            self._log(
+                f"Validate: авто-сокращено {trimmed_rows} строк "
+                f"(убраны целые keywords/слова с конца, без обрезки посередине)."
+            )
         self._log("Validate завершен для таблицы переводов.")
 
     def _on_translation_item_changed(self, item):
@@ -4583,7 +4897,11 @@ class MainWindow(QWidget):
         if skipped_empty:
             self._log(f"⚠️ Пропущено пустых строк: {skipped_empty}.")
         self._set_translation_buttons_enabled(False)
-        self.translation_upload_worker = LocalizationUploadWorker(self._metadata_api_creds(), upload_rows)
+        self.translation_upload_worker = LocalizationUploadWorker(
+            self._metadata_api_creds(),
+            upload_rows,
+            version_url_defaults=self._version_url_defaults_from_gui(),
+        )
         self.translation_upload_worker.log_msg.connect(self._log)
         self.translation_upload_worker.progress_update.connect(self._update_progress)
         self.translation_upload_worker.upload_finished.connect(self._on_translation_upload_finished)
@@ -5077,7 +5395,7 @@ class MainWindow(QWidget):
                 results.append("⚠️ Keywords лучше держать lowercase")
             if " " in keywords:
                 results.append("⚠️ Keywords содержат пробелы — для ASO чаще нужен плотный comma-separated формат")
-            keyword_items = [item.strip() for item in keywords.split(",") if item.strip()]
+            keyword_items = _split_keyword_parts(keywords)
             duplicates = sorted({item for item in keyword_items if keyword_items.count(item) > 1})
             if duplicates:
                 results.append(f"⚠️ Keywords имеют дубли: {', '.join(duplicates)}")
@@ -5380,7 +5698,8 @@ class MainWindow(QWidget):
                 self.meta_description_input.setPlainText(str(metadata.get("description", ""))[:4000])
                 self._log("✅ Description обновлён.")
             elif mode in ("keywords", "shorten_keywords") and metadata.get("keywords"):
-                self.meta_keywords_input.setText(str(metadata.get("keywords", ""))[:100])
+                keywords, _ = truncate_keywords_to_limit(str(metadata.get("keywords", "")))
+                self.meta_keywords_input.setText(keywords)
                 self._log("✅ Keywords обновлены.")
             elif mode == "subtitle" and metadata.get("subtitle"):
                 self.meta_subtitle_input.setText(str(metadata.get("subtitle", ""))[:30])
@@ -5406,13 +5725,16 @@ class MainWindow(QWidget):
             return
 
         if metadata.get("subtitle"):
-            self.meta_subtitle_input.setText(str(metadata.get("subtitle", ""))[:30])
+            subtitle, _ = truncate_metadata_field("subtitle", str(metadata.get("subtitle", "")))
+            self.meta_subtitle_input.setText(subtitle)
         if metadata.get("description"):
             self.meta_description_input.setPlainText(str(metadata.get("description", "")))
         if metadata.get("keywords"):
-            self.meta_keywords_input.setText(str(metadata.get("keywords", ""))[:100])
+            keywords, _ = truncate_keywords_to_limit(str(metadata.get("keywords", "")))
+            self.meta_keywords_input.setText(keywords)
         if metadata.get("promotionalText"):
-            self.meta_promotional_text_input.setPlainText(str(metadata.get("promotionalText", ""))[:170])
+            promo, _ = truncate_metadata_field("promotionalText", str(metadata.get("promotionalText", "")))
+            self.meta_promotional_text_input.setPlainText(promo)
         if metadata.get("whatsNew"):
             self.meta_whats_new_input.setPlainText(str(metadata.get("whatsNew", "")))
         if metadata.get("primaryCategory"):
@@ -5429,11 +5751,12 @@ class MainWindow(QWidget):
     def _normalize_keywords_locally(self):
         raw = self._line_text(self.meta_keywords_input)
         seen = []
-        for item in raw.split(","):
+        for item in _split_keyword_parts(raw):
             normalized = re.sub(r"\s+", "", item.strip().lower())
             if normalized and normalized not in seen:
                 seen.append(normalized)
-        result = ",".join(seen)[:100]
+        result = ",".join(seen)
+        result, _changed = truncate_keywords_to_limit(result, METADATA_FIELD_LIMITS["keywords"])
         self.meta_keywords_input.setText(result)
         self._log(f"Keywords нормализованы локально: {len(result)}/100")
 
@@ -5455,11 +5778,15 @@ class MainWindow(QWidget):
         self._log("Dash символы удалены локально из основных ASO-полей.")
 
     def _truncate_to_limits_locally(self):
-        self.meta_subtitle_input.setText(self._line_text(self.meta_subtitle_input)[:30])
-        self.meta_keywords_input.setText(self._line_text(self.meta_keywords_input)[:100])
-        self.meta_promotional_text_input.setPlainText(self._text_edit_text(self.meta_promotional_text_input)[:170])
-        self.meta_description_input.setPlainText(self._text_edit_text(self.meta_description_input)[:4000])
-        self._log("Поля локально обрезаны до базовых лимитов App Store.")
+        subtitle, _ = truncate_metadata_field("subtitle", self._line_text(self.meta_subtitle_input))
+        keywords, _ = truncate_metadata_field("keywords", self._line_text(self.meta_keywords_input))
+        promo, _ = truncate_metadata_field("promotionalText", self._text_edit_text(self.meta_promotional_text_input))
+        description, _ = truncate_metadata_field("description", self._text_edit_text(self.meta_description_input))
+        self.meta_subtitle_input.setText(subtitle)
+        self.meta_keywords_input.setText(keywords)
+        self.meta_promotional_text_input.setPlainText(promo)
+        self.meta_description_input.setPlainText(description)
+        self._log("Поля локально сокращены до лимитов Apple (целые слова/keywords с конца).")
 
     def _run_fix_action(self, mode):
         if mode == "normalize_keywords":
@@ -5624,7 +5951,11 @@ class MainWindow(QWidget):
         self.progress_bar.setValue(0)
         self.time_label.setText("Загрузка: 0%")
         self.screenshot_upload_worker = ScreenshotUploadWorker(
-            api_creds, target_locales, self.upload_jpeg_files, self._tinypng_api_key()
+            api_creds,
+            target_locales,
+            self.upload_jpeg_files,
+            self._tinypng_api_key(),
+            version_url_defaults=self._version_url_defaults_from_gui(),
         )
         self.screenshot_upload_worker.log_msg.connect(self._log)
         self.screenshot_upload_worker.progress_update.connect(self._update_progress)
