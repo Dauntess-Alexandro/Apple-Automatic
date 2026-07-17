@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PPO Automation — Дизайн-мокапы</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a2e; }
+
+  /* ===== Панель переключения вариантов ===== */
+  .switcher {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+    background: #0d0d1a; border-bottom: 1px solid #333;
+    padding: 10px 20px; display: flex; gap: 10px; align-items: center;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.5);
+  }
+  .switcher .title { color: #fff; font-weight: 700; font-size: 14px; margin-right: 16px; }
+  .switcher button {
+    background: #2a2a4a; color: #ccc; border: 1px solid #444;
+    padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600;
+    transition: all .2s;
+  }
+  .switcher button:hover { background: #3a3a5a; color: #fff; }
+  .switcher button.active { background: #6D8DFF; color: #07111F; border-color: #6D8DFF; }
+  .switcher .hint { color: #888; font-size: 12px; margin-left: auto; }
+
+  .variant { display: none; padding-top: 56px; min-height: 100vh; }
+  .variant.active { display: block; }
+
+  /* Общие элементы мокапа */
+  .app-window { width: 100%; min-height: calc(100vh - 56px); display: flex; flex-direction: column; }
+  .app-header { padding: 14px 24px; display: flex; align-items: center; gap: 16px; }
+  .app-logo { font-size: 18px; font-weight: 800; display: flex; align-items: center; gap: 8px; }
+  .app-logo .dot { width: 28px; height: 28px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; font-size: 16px; }
+  .app-summary { font-size: 12px; opacity: .7; }
+  .app-body { display: flex; flex: 1; }
+  .sidebar { width: 220px; padding: 16px 12px; flex-shrink: 0; }
+  .sidebar-item { padding: 11px 14px; border-radius: 10px; cursor: pointer; font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+  .sidebar-item .ico { width: 20px; text-align: center; }
+  .content { flex: 1; padding: 24px 28px; overflow-y: auto; }
+  .page-title { font-size: 22px; font-weight: 800; margin-bottom: 4px; }
+  .page-sub { font-size: 13px; opacity: .6; margin-bottom: 24px; }
+  .card { border-radius: 14px; padding: 20px; margin-bottom: 16px; }
+  .card-title { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; opacity: .7; margin-bottom: 14px; }
+  .row { display: flex; gap: 16px; margin-bottom: 14px; }
+  .field { flex: 1; }
+  .field label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 6px; opacity: .8; }
+  .input { width: 100%; padding: 10px 12px; border-radius: 9px; font-size: 14px; border: 1px solid; }
+  .btn { padding: 10px 18px; border-radius: 10px; font-size: 14px; font-weight: 700; cursor: pointer; border: none; }
+  .btn-primary { font-size: 15px; padding: 13px 22px; }
+  .btn-ghost { font-size: 12px; padding: 6px 12px; }
+  .exec-panel { border-radius: 14px; padding: 16px 20px; display: flex; align-items: center; gap: 16px; }
+  .progress { flex: 1; height: 30px; border-radius: 8px; overflow: hidden; position: relative; }
+  .progress-fill { height: 100%; width: 35%; border-radius: 8px; }
+  .log { border-radius: 12px; padding: 14px; font-family: "SF Mono", Menlo, monospace; font-size: 12px; height: 120px; overflow-y: auto; }
+  .log-line { padding: 2px 0; opacity: .85; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 700; }
+  .badge-ok { background: rgba(74,222,128,.15); color: #4ADE80; }
+  .badge-warn { background: rgba(251,191,36,.15); color: #FBBF24; }
+
+  /* ================================================================
+     ВАРИАНТ 1 — Deep Blue (текущий, улучшенный)
+     ================================================================ */
+  .v1 { background: #0B1020; color: #EAF0FF; }
+  .v1 .app-header { background: #0D1728; border-bottom: 1px solid #26324A; }
+  .v1 .app-logo .dot { background: linear-gradient(135deg, #7C9CFF, #5A7AE8); color: #07111F; }
+  .v1 .sidebar { background: #0D1728; border-right: 1px solid #26324A; }
+  .v1 .sidebar-item.active { background: #18243A; border-left: 3px solid #6D8DFF; color: #F7FAFF; }
+  .v1 .sidebar-item:hover { background: #141d33; }
+  .v1 .card { background: #111827; border: 1px solid #26324A; }
+  .v1 .input { background: #0F172A; border-color: #2B3A55; color: #F8FAFC; }
+  .v1 .input:focus { border-color: #7C9CFF; }
+  .v1 .btn-primary { background: linear-gradient(180deg, #7C9CFF, #5A7AE8); color: #07111F; }
+  .v1 .btn-ghost { background: #151F32; color: #DCE7FF; border: 1px solid #2C3B5A; }
+  .v1 .exec-panel { background: #0D1728; border: 1px solid #26324A; border-top: 3px solid #6D8DFF; }
+  .v1 .progress { background: #0F172A; border: 1px solid #2B3A55; }
+  .v1 .progress-fill { background: linear-gradient(90deg, #5A7AE8, #7C9CFF); }
+  .v1 .log { background: #08111F; border: 1px solid #26324A; color: #DCE7FF; }
+
+  /* ================================================================
+     ВАРИАНТ 2 — Midnight Pro (глубокий тёмный + неоновые акценты)
+     ================================================================ */
+  .v2 { background: #0a0a0f; color: #e8e8f0; }
+  .v2 .app-header { background: linear-gradient(180deg, #12121f, #0a0a0f); border-bottom: 1px solid #1e1e35; }
+  .v2 .app-logo .dot { background: linear-gradient(135deg, #a855f7, #6366f1); color: #fff; box-shadow: 0 0 20px rgba(168,85,247,.4); }
+  .v2 .sidebar { background: #0d0d18; border-right: 1px solid #1e1e35; }
+  .v2 .sidebar-item.active { background: linear-gradient(90deg, rgba(168,85,247,.2), transparent); border-left: 3px solid #a855f7; color: #fff; }
+  .v2 .sidebar-item:hover { background: rgba(168,85,247,.1); }
+  .v2 .card { background: linear-gradient(180deg, #14142a, #10101e); border: 1px solid #1e1e35; box-shadow: 0 4px 20px rgba(0,0,0,.3); }
+  .v2 .card-title { color: #a855f7; }
+  .v2 .input { background: #0d0d18; border-color: #2a2a45; color: #f0f0ff; }
+  .v2 .input:focus { border-color: #a855f7; box-shadow: 0 0 0 3px rgba(168,85,247,.15); }
+  .v2 .btn-primary { background: linear-gradient(135deg, #a855f7, #6366f1); color: #fff; box-shadow: 0 4px 16px rgba(168,85,247,.35); }
+  .v2 .btn-ghost { background: #1a1a2e; color: #c4b5fd; border: 1px solid #2a2a45; }
+  .v2 .exec-panel { background: linear-gradient(180deg, #14142a, #0d0d18); border: 1px solid #2a2a45; border-top: 3px solid #a855f7; }
+  .v2 .progress { background: #0d0d18; border: 1px solid #2a2a45; }
+  .v2 .progress-fill { background: linear-gradient(90deg, #6366f1, #a855f7, #ec4899); }
+  .v2 .log { background: #06060d; border: 1px solid #1e1e35; color: #c4b5fd; }
+  .v2 .page-title { background: linear-gradient(90deg, #fff, #c4b5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+
+  /* ================================================================
+     ВАРИАНТ 3 — Light Clean (светлая профессиональная)
+     ================================================================ */
+  .v3 { background: #f1f5f9; color: #1e293b; }
+  .v3 .app-header { background: #fff; border-bottom: 1px solid #e2e8f0; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+  .v3 .app-logo .dot { background: linear-gradient(135deg, #3b82f6, #2563eb); color: #fff; }
+  .v3 .sidebar { background: #fff; border-right: 1px solid #e2e8f0; }
+  .v3 .sidebar-item.active { background: #eff6ff; border-left: 3px solid #3b82f6; color: #1d4ed8; }
+  .v3 .sidebar-item:hover { background: #f8fafc; }
+  .v3 .card { background: #fff; border: 1px solid #e2e8f0; box-shadow: 0 1px 3px rgba(0,0,0,.04); }
+  .v3 .card-title { color: #64748b; }
+  .v3 .input { background: #f8fafc; border-color: #cbd5e1; color: #1e293b; }
+  .v3 .input:focus { border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,.1); }
+  .v3 .btn-primary { background: #2563eb; color: #fff; }
+  .v3 .btn-primary:hover { background: #1d4ed8; }
+  .v3 .btn-ghost { background: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; }
+  .v3 .exec-panel { background: #fff; border: 1px solid #e2e8f0; border-top: 3px solid #3b82f6; box-shadow: 0 1px 3px rgba(0,0,0,.04); }
+  .v3 .progress { background: #f1f5f9; border: 1px solid #e2e8f0; }
+  .v3 .progress-fill { background: linear-gradient(90deg, #2563eb, #60a5fa); }
+  .v3 .log { background: #f8fafc; border: 1px solid #e2e8f0; color: #475569; }
+  .v3 .page-sub { color: #64748b; }
+
+  /* ================================================================
+     ВАРИАНТ 4 — Glassmorphism (стекло + размытие + градиент-фон)
+     ================================================================ */
+  .v4 { background: linear-gradient(135deg, #1e1b4b 0%, #312e81 30%, #4c1d95 60%, #831843 100%); color: #f1f5f9; min-height: 100vh; }
+  .v4 .app-window { background: transparent; }
+  .v4 .app-header { background: rgba(255,255,255,.06); backdrop-filter: blur(20px); border-bottom: 1px solid rgba(255,255,255,.1); }
+  .v4 .app-logo .dot { background: rgba(255,255,255,.15); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,.2); color: #fff; }
+  .v4 .sidebar { background: rgba(255,255,255,.05); backdrop-filter: blur(20px); border-right: 1px solid rgba(255,255,255,.1); }
+  .v4 .sidebar-item.active { background: rgba(255,255,255,.12); border-left: 3px solid #f0abfc; color: #fff; }
+  .v4 .sidebar-item:hover { background: rgba(255,255,255,.08); }
+  .v4 .card { background: rgba(255,255,255,.07); backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,.12); box-shadow: 0 8px 32px rgba(0,0,0,.2); }
+  .v4 .card-title { color: #f0abfc; }
+  .v4 .input { background: rgba(255,255,255,.08); border-color: rgba(255,255,255,.15); color: #fff; backdrop-filter: blur(10px); }
+  .v4 .input:focus { border-color: #f0abfc; box-shadow: 0 0 0 3px rgba(240,171,252,.15); }
+  .v4 .btn-primary { background: rgba(255,255,255,.2); backdrop-filter: blur(10px); color: #fff; border: 1px solid rgba(255,255,255,.3); box-shadow: 0 4px 16px rgba(0,0,0,.2); }
+  .v4 .btn-ghost { background: rgba(255,255,255,.08); color: #f0abfc; border: 1px solid rgba(255,255,255,.15); }
+  .v4 .exec-panel { background: rgba(255,255,255,.07); backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,.12); border-top: 3px solid #f0abfc; }
+  .v4 .progress { background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.15); }
+  .v4 .progress-fill { background: linear-gradient(90deg, #c084fc, #f0abfc, #f9a8d4); }
+  .v4 .log { background: rgba(0,0,0,.2); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,.1); color: #f0abfc; }
+  .v4 .page-title { color: #fff; }
+  .v4 .page-sub { color: rgba(255,255,255,.6); }
+
+  .variant-label { position: fixed; bottom: 16px; right: 20px; z-index: 999;
+    padding: 8px 16px; border-radius: 20px; font-size: 12px; font-weight: 700;
+    background: rgba(0,0,0,.7); color: #fff; backdrop-filter: blur(10px); }
+</style>
+</head>
+<body>
+
+<!-- Переключатель -->
+<div class="switcher">
+  <span class="title">🎨 Дизайн PPO Automation</span>
+  <button class="active" onclick="showVariant(1, this)">1. Deep Blue</button>
+  <button onclick="showVariant(2, this)">2. Midnight Pro</button>
+  <button onclick="showVariant(3, this)">3. Light Clean</button>
+  <button onclick="showVariant(4, this)">4. Glassmorphism</button>
+  <span class="hint">← кликайте, чтобы сравнить</span>
+</div>
+
+<!-- ============ ВАРИАНТ 1: Deep Blue ============ -->
+<div class="variant active" id="v1">
+<div class="v1"><div class="app-window">
+  <div class="app-header">
+    <div class="app-logo"><span class="dot">🍏</span> PPO Automation</div>
+    <span class="app-summary">Готово к запуску | MyApp · v2.4.1 · App ID: 1234567890</span>
+  </div>
+  <div class="app-body">
+    <div class="sidebar">
+      <div class="sidebar-item active"><span class="ico">✚</span> Новый тест</div>
+      <div class="sidebar-item"><span class="ico">↻</span> Обновить тест</div>
+      <div class="sidebar-item"><span class="ico">📝</span> Метаданные</div>
+      <div class="sidebar-item"><span class="ico">🌐</span> Перевод локализации</div>
+      <div class="sidebar-item"><span class="ico">📸</span> Скриншоты</div>
+    </div>
+    <div class="content">
+      <div class="page-title">Новый PPO тест</div>
+      <div class="page-sub">Создание эксперимента Product Page Optimization с вариантами тестирования</div>
+
+      <div class="card">
+        <div class="card-title">⚙️ Параметры теста</div>
+        <div class="row">
+          <div class="field"><label>Название теста</label><input class="input" value="Spring Icons Test"></div>
+          <div class="field"><label>Версия приложения</label><input class="input" value="2.4.1"></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Трафик (%)</label><input class="input" value="50"></div>
+          <div class="field"><label>Длительность (дни)</label><input class="input" value="14"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🎯 Варианты (A/B/C)</div>
+        <div class="grid2">
+          <div class="field"><label>Variant A — иконка</label><input class="input" value="icon_a.png"></div>
+          <div class="field"><label>Variant B — иконка</label><input class="input" value="icon_b.png"></div>
+        </div>
+      </div>
+
+      <div class="exec-panel">
+        <button class="btn btn-primary">▶ Запустить тест</button>
+        <div class="progress"><div class="progress-fill"></div></div>
+        <span style="font-size:13px;font-weight:700;white-space:nowrap;">35% · 02:14</span>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="card-title">📋 Лог выполнения</div>
+        <div class="log">
+          <div class="log-line">✅ Авторизация App Store Connect OK</div>
+          <div class="log-line">✅ Создан experiment treatment «Variant A»</div>
+          <div class="log-line">⏳ Загрузка скриншотов для locale en-US...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div></div>
+<div class="variant-label">Вариант 1 · Deep Blue (текущий, улучшенный)</div>
+</div>
+
+<!-- ============ ВАРИАНТ 2: Midnight Pro ============ -->
+<div class="variant" id="v2">
+<div class="v2"><div class="app-window">
+  <div class="app-header">
+    <div class="app-logo"><span class="dot">🍏</span> PPO Automation</div>
+    <span class="app-summary">Готово к запуску | MyApp · v2.4.1 · App ID: 1234567890</span>
+  </div>
+  <div class="app-body">
+    <div class="sidebar">
+      <div class="sidebar-item active"><span class="ico">✚</span> Новый тест</div>
+      <div class="sidebar-item"><span class="ico">↻</span> Обновить тест</div>
+      <div class="sidebar-item"><span class="ico">📝</span> Метаданные</div>
+      <div class="sidebar-item"><span class="ico">🌐</span> Перевод локализации</div>
+      <div class="sidebar-item"><span class="ico">📸</span> Скриншоты</div>
+    </div>
+    <div class="content">
+      <div class="page-title">Новый PPO тест</div>
+      <div class="page-sub">Создание эксперимента Product Page Optimization с вариантами тестирования</div>
+
+      <div class="card">
+        <div class="card-title">⚙️ Параметры теста</div>
+        <div class="row">
+          <div class="field"><label>Название теста</label><input class="input" value="Spring Icons Test"></div>
+          <div class="field"><label>Версия приложения</label><input class="input" value="2.4.1"></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Трафик (%)</label><input class="input" value="50"></div>
+          <div class="field"><label>Длительность (дни)</label><input class="input" value="14"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🎯 Варианты (A/B/C)</div>
+        <div class="grid2">
+          <div class="field"><label>Variant A — иконка</label><input class="input" value="icon_a.png"></div>
+          <div class="field"><label>Variant B — иконка</label><input class="input" value="icon_b.png"></div>
+        </div>
+      </div>
+
+      <div class="exec-panel">
+        <button class="btn btn-primary">▶ Запустить тест</button>
+        <div class="progress"><div class="progress-fill"></div></div>
+        <span style="font-size:13px;font-weight:700;white-space:nowrap;">35% · 02:14</span>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="card-title">📋 Лог выполнения</div>
+        <div class="log">
+          <div class="log-line">✅ Авторизация App Store Connect OK</div>
+          <div class="log-line">✅ Создан experiment treatment «Variant A»</div>
+          <div class="log-line">⏳ Загрузка скриншотов для locale en-US...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div></div>
+<div class="variant-label">Вариант 2 · Midnight Pro (неон + градиенты)</div>
+</div>
+
+<!-- ============ ВАРИАНТ 3: Light Clean ============ -->
+<div class="variant" id="v3">
+<div class="v3"><div class="app-window">
+  <div class="app-header">
+    <div class="app-logo"><span class="dot">🍏</span> PPO Automation</div>
+    <span class="app-summary">Готово к запуску | MyApp · v2.4.1 · App ID: 1234567890</span>
+  </div>
+  <div class="app-body">
+    <div class="sidebar">
+      <div class="sidebar-item active"><span class="ico">✚</span> Новый тест</div>
+      <div class="sidebar-item"><span class="ico">↻</span> Обновить тест</div>
+      <div class="sidebar-item"><span class="ico">📝</span> Метаданные</div>
+      <div class="sidebar-item"><span class="ico">🌐</span> Перевод локализации</div>
+      <div class="sidebar-item"><span class="ico">📸</span> Скриншоты</div>
+    </div>
+    <div class="content">
+      <div class="page-title">Новый PPO тест</div>
+      <div class="page-sub">Создание эксперимента Product Page Optimization с вариантами тестирования</div>
+
+      <div class="card">
+        <div class="card-title">⚙️ Параметры теста</div>
+        <div class="row">
+          <div class="field"><label>Название теста</label><input class="input" value="Spring Icons Test"></div>
+          <div class="field"><label>Версия приложения</label><input class="input" value="2.4.1"></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Трафик (%)</label><input class="input" value="50"></div>
+          <div class="field"><label>Длительность (дни)</label><input class="input" value="14"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🎯 Варианты (A/B/C)</div>
+        <div class="grid2">
+          <div class="field"><label>Variant A — иконка</label><input class="input" value="icon_a.png"></div>
+          <div class="field"><label>Variant B — иконка</label><input class="input" value="icon_b.png"></div>
+        </div>
+      </div>
+
+      <div class="exec-panel">
+        <button class="btn btn-primary">▶ Запустить тест</button>
+        <div class="progress"><div class="progress-fill"></div></div>
+        <span style="font-size:13px;font-weight:700;white-space:nowrap;">35% · 02:14</span>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="card-title">📋 Лог выполнения</div>
+        <div class="log">
+          <div class="log-line">✅ Авторизация App Store Connect OK</div>
+          <div class="log-line">✅ Создан experiment treatment «Variant A»</div>
+          <div class="log-line">⏳ Загрузка скриншотов для locale en-US...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div></div>
+<div class="variant-label">Вариант 3 · Light Clean (светлая профессиональная)</div>
+</div>
+
+<!-- ============ ВАРИАНТ 4: Glassmorphism ============ -->
+<div class="variant" id="v4">
+<div class="v4"><div class="app-window">
+  <div class="app-header">
+    <div class="app-logo"><span class="dot">🍏</span> PPO Automation</div>
+    <span class="app-summary">Готово к запуску | MyApp · v2.4.1 · App ID: 1234567890</span>
+  </div>
+  <div class="app-body">
+    <div class="sidebar">
+      <div class="sidebar-item active"><span class="ico">✚</span> Новый тест</div>
+      <div class="sidebar-item"><span class="ico">↻</span> Обновить тест</div>
+      <div class="sidebar-item"><span class="ico">📝</span> Метаданные</div>
+      <div class="sidebar-item"><span class="ico">🌐</span> Перевод локализации</div>
+      <div class="sidebar-item"><span class="ico">📸</span> Скриншоты</div>
+    </div>
+    <div class="content">
+      <div class="page-title">Новый PPO тест</div>
+      <div class="page-sub">Создание эксперимента Product Page Optimization с вариантами тестирования</div>
+
+      <div class="card">
+        <div class="card-title">⚙️ Параметры теста</div>
+        <div class="row">
+          <div class="field"><label>Название теста</label><input class="input" value="Spring Icons Test"></div>
+          <div class="field"><label>Версия приложения</label><input class="input" value="2.4.1"></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Трафик (%)</label><input class="input" value="50"></div>
+          <div class="field"><label>Длительность (дни)</label><input class="input" value="14"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🎯 Варианты (A/B/C)</div>
+        <div class="grid2">
+          <div class="field"><label>Variant A — иконка</label><input class="input" value="icon_a.png"></div>
+          <div class="field"><label>Variant B — иконка</label><input class="input" value="icon_b.png"></div>
+        </div>
+      </div>
+
+      <div class="exec-panel">
+        <button class="btn btn-primary">▶ Запустить тест</button>
+        <div class="progress"><div class="progress-fill"></div></div>
+        <span style="font-size:13px;font-weight:700;white-space:nowrap;">35% · 02:14</span>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="card-title">📋 Лог выполнения</div>
+        <div class="log">
+          <div class="log-line">✅ Авторизация App Store Connect OK</div>
+          <div class="log-line">✅ Создан experiment treatment «Variant A»</div>
+          <div class="log-line">⏳ Загрузка скриншотов для locale en-US...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div></div>
+<div class="variant-label">Вариант 4 · Glassmorphism (стекло + градиент-фон)</div>
+</div>
+
+<script>
+function showVariant(n, btn) {
+  document.querySelectorAll('.variant').forEach(v => v.classList.remove('active'));
+  document.querySelectorAll('.switcher button').forEach(b => b.classList.remove('active'));
+  document.getElementById('v' + n).classList.add('active');
+  btn.classList.add('active');
+}
+</script>
+</body>
+</html>

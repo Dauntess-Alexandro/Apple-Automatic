@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PPO Automation — Верстка Метаданные + API</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0a0a0f; color: #e8e8f0; }
+
+  /* Переключатель */
+  .switcher {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+    background: #06060d; border-bottom: 1px solid #2a2a45;
+    padding: 10px 20px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    box-shadow: 0 2px 16px rgba(0,0,0,.6);
+  }
+  .switcher .title { color: #fff; font-weight: 800; font-size: 14px; margin-right: 12px; }
+  .switcher button {
+    background: #1a1a2e; color: #9ca3af; border: 1px solid #2a2a45;
+    padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600;
+    transition: all .2s;
+  }
+  .switcher button:hover { background: #222238; color: #c4b5fd; }
+  .switcher button.active { background: linear-gradient(135deg, #a855f7, #6366f1); color: #fff; border-color: transparent; }
+  .switcher .hint { color: #6b7280; font-size: 12px; margin-left: auto; }
+
+  .screen { display: none; padding-top: 56px; min-height: 100vh; }
+  .screen.active { display: flex; }
+
+  /* ===== Общий каркас ===== */
+  .app { display: flex; width: 100%; min-height: calc(100vh - 56px); }
+  .sidebar { width: 210px; background: #0d0d18; border-right: 1px solid #2a2a45; padding: 16px 12px; flex-shrink: 0; }
+  .sidebar .logo { color: #fff; font-size: 16px; font-weight: 800; padding: 4px 6px; margin-bottom: 14px; }
+  .nav-item { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-radius: 8px; color: #9ca3af; font-size: 14px; font-weight: 600; cursor: pointer; margin-bottom: 2px; border-left: 3px solid transparent; }
+  .nav-item:hover { background: rgba(168,85,247,.10); color: #c4b5fd; }
+  .nav-item.active { background: linear-gradient(90deg, rgba(168,85,247,.22), rgba(168,85,247,.02)); border-left: 3px solid #a855f7; color: #fff; font-weight: 700; }
+  .nav-item .ico { width: 20px; text-align: center; }
+
+  .main-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .topbar { background: #0d0d18; border-bottom: 1px solid #2a2a45; padding: 10px 24px; display: flex; align-items: center; gap: 12px; }
+  .topbar .summary { font-size: 12px; color: #9ca3af; }
+  .topbar .badge-ok { background: rgba(74,222,128,.15); color: #4ADE80; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 700; }
+  .topbar .gear-btn { margin-left: auto; background: #1a1a2e; border: 1px solid #2a2a45; color: #c4b5fd; padding: 7px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; }
+
+  .content-row { flex: 1; display: flex; overflow: hidden; }
+  .page { flex: 1; overflow-y: auto; padding: 24px 28px; }
+  .exec-panel { width: 360px; background: #14142a; border-left: 1px solid #2a2a45; border-top: 3px solid #a855f7; padding: 16px; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; }
+  .exec-panel h3 { font-size: 14px; font-weight: 700; color: #c4b5fd; }
+  .exec-panel .sub { font-size: 12px; color: #6b7280; }
+  .progress { height: 30px; background: #0d0d18; border: 1px solid #2a2a45; border-radius: 8px; overflow: hidden; }
+  .progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #6366f1, #a855f7, #ec4899); border-radius: 8px; }
+  .log { flex: 1; background: #06060d; border: 1px solid #1e1e35; border-radius: 10px; padding: 10px; font-family: "SF Mono", Menlo, monospace; font-size: 12px; color: #c4b5fd; overflow-y: auto; min-height: 200px; }
+  .log div { padding: 2px 0; }
+  .start-btn { background: linear-gradient(135deg, #a855f7, #6366f1); color: #fff; border: none; border-radius: 10px; padding: 13px; font-size: 15px; font-weight: 700; cursor: pointer; }
+
+  /* ===== Элементы формы ===== */
+  .page-title { font-size: 22px; font-weight: 800; color: #fff; margin-bottom: 4px; }
+  .page-sub { font-size: 13px; color: #6b7280; margin-bottom: 20px; }
+  .card { background: #14142a; border: 1px solid #2a2a45; border-radius: 14px; padding: 20px; margin-bottom: 16px; }
+  .card-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: #a855f7; margin-bottom: 14px; }
+  .form-row { display: flex; gap: 16px; margin-bottom: 12px; align-items: flex-start; }
+  .form-row:last-child { margin-bottom: 0; }
+  .field { flex: 1; }
+  .field label { display: block; font-size: 12px; font-weight: 600; color: #c4b5fd; margin-bottom: 6px; }
+  .field .counter { font-size: 11px; color: #6b7280; margin-top: 3px; }
+  .input, .textarea, .select { width: 100%; background: #0d0d18; border: 1px solid #2a2a45; border-radius: 8px; padding: 9px 12px; color: #f0f0ff; font-size: 14px; font-family: inherit; }
+  .textarea { resize: vertical; min-height: 60px; }
+  .input:focus, .textarea:focus, .select:focus { outline: none; border-color: #a855f7; }
+  .btn { padding: 9px 16px; border-radius: 8px; font-size: 13px; font-weight: 700; cursor: pointer; border: 1px solid #2a2a45; background: #1a1a2e; color: #c4b5fd; }
+  .btn:hover { background: #222238; }
+  .btn-primary { background: linear-gradient(135deg, #a855f7, #6366f1); color: #fff; border: none; }
+  .btn-ai { background: linear-gradient(135deg, #a855f7, #6366f1); color: #fff; border: none; font-size: 14px; padding: 12px; width: 100%; }
+  .field-with-btn { display: flex; gap: 8px; align-items: center; }
+  .field-with-btn .input { flex: 1; }
+  .ai-mini-btn { background: rgba(168,85,247,.15); border: 1px solid #a855f7; color: #c4b5fd; padding: 7px 10px; border-radius: 7px; font-size: 11px; font-weight: 700; cursor: pointer; white-space: nowrap; }
+  .ai-mini-btn:hover { background: rgba(168,85,247,.3); }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
+  .checkbox { width: 18px; height: 18px; border: 1px solid #2a2a45; border-radius: 5px; background: #0d0d18; display: inline-flex; align-items: center; justify-content: center; }
+  .checkbox.checked { background: #a855f7; border-color: #c084fc; }
+  .checkbox.checked::after { content: "✓"; color: #fff; font-size: 12px; font-weight: 700; }
+  .grid-fix { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .pill { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 11px; font-weight: 700; background: rgba(168,85,247,.15); color: #c4b5fd; }
+
+  .variant-label { position: fixed; bottom: 16px; right: 20px; z-index: 999; padding: 8px 16px; border-radius: 20px; font-size: 12px; font-weight: 700; background: rgba(0,0,0,.8); color: #c4b5fd; backdrop-filter: blur(10px); }
+
+  /* ===== ВАРИАНТ A: Двухколоночная верстка метаданных ===== */
+  .meta-grid-2col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  .meta-grid-2col .card { margin-bottom: 0; }
+
+  /* ===== ВАРИАНТ B: Аккордеон-секции + широкие карточки ===== */
+  .section-accordion .card { margin-bottom: 12px; }
+  .section-accordion .card-header { display: flex; align-items: center; justify-content: space-between; cursor: pointer; }
+  .section-accordion .card-header .chevron { color: #6b7280; }
+  .section-accordion .card.collapsed .card-body { display: none; }
+
+  /* ===== ВАРИАНТ C: Мастер-форма в одну колонку, AI сбоку ===== */
+  .layout-with-ai-rail { display: grid; grid-template-columns: 1fr 300px; gap: 16px; align-items: start; }
+  .ai-rail { position: sticky; top: 0; }
+  .ai-rail .card { margin-bottom: 12px; }
+</style>
+</head>
+<body>
+
+<div class="switcher">
+  <span class="title">🎨 Верстка: Метаданные + API</span>
+  <button class="active" onclick="showScreen('metaA', this)">Метаданные A — 2 колонки</button>
+  <button onclick="showScreen('metaB', this)">Метаданные B — аккордеон</button>
+  <button onclick="showScreen('metaC', this)">Метаданные C — AI рейл</button>
+  <button onclick="showScreen('apiA', this)">Настройки API A</button>
+  <button onclick="showScreen('apiB', this)">Настройки API B</button>
+  <span class="hint">← кликайте для сравнения</span>
+</div>
+
+<!-- ================================================================ -->
+<!-- МЕТАДАННЫЕ ВАРИАНТ A: Двухколоночная верстка -->
+<!-- ================================================================ -->
+<div class="screen active" id="metaA">
+<div class="app">
+  <div class="sidebar">
+    <div class="logo">🍏 PPO Automation</div>
+    <div class="nav-item"><span class="ico">✚</span> Новый тест</div>
+    <div class="nav-item"><span class="ico">↻</span> Обновить тест</div>
+    <div class="nav-item active"><span class="ico">📝</span> Метаданные</div>
+    <div class="nav-item"><span class="ico">🌐</span> Перевод локализации</div>
+    <div class="nav-item"><span class="ico">📸</span> Скриншоты</div>
+  </div>
+  <div class="main-area">
+    <div class="topbar">
+      <span class="badge-ok">● Готово</span>
+      <span class="summary">MyApp · v2.4.1 · App ID: 1234567890</span>
+      <button class="gear-btn">⚙ Настройки API</button>
+    </div>
+    <div class="content-row">
+      <div class="page">
+        <div class="page-title">Метаданные приложения</div>
+        <div class="page-sub">Заполните поля — программа соберёт payload для App Store Connect. Слева — контент, справа — AI инструменты.</div>
+
+        <!-- Источник + локаль в одну строку -->
+        <div class="card">
+          <div class="card-title">📡 Источник данных</div>
+          <div class="form-row">
+            <div class="field"><label>Локаль</label>
+              <select class="select"><option>English (en-US)</option><option>Русский (ru)</option></select>
+            </div>
+            <div class="field"><label>Версия</label><input class="input" value="2.4.1" readonly></div>
+            <div class="field" style="flex:0 0 auto;align-self:flex-end;">
+              <button class="btn-primary" style="padding:9px 22px;border-radius:8px;border:none;font-size:14px;font-weight:700;cursor:pointer;">⬇ Pull from Apple</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- ДВЕ КОЛОНКИ: Version metadata | App info -->
+        <div class="meta-grid-2col">
+          <div class="card">
+            <div class="card-title">📋 Version metadata</div>
+            <div class="form-row" style="flex-direction:column;">
+              <div class="field"><label>Description <span class="counter">· 0/4000</span></label>
+                <textarea class="textarea" style="min-height:90px;" placeholder="Description / описание приложения"></textarea>
+                <button class="ai-mini-btn" style="margin-top:5px;">✨ AI</button>
+              </div>
+            </div>
+            <div class="form-row" style="flex-direction:column;">
+              <div class="field"><label>Keywords <span class="counter">· 0/100</span></label>
+                <div class="field-with-btn"><input class="input" placeholder="keyword1,keyword2,keyword3"><button class="ai-mini-btn">✨</button></div>
+              </div>
+            </div>
+            <div class="form-row" style="flex-direction:column;">
+              <div class="field"><label>Promotional text <span class="counter">· 0/170</span></label>
+                <div class="field-with-btn"><textarea class="textarea" style="min-height:50px;" placeholder="Promotional text"></textarea></div>
+                <button class="ai-mini-btn" style="margin-top:5px;">✨ AI</button>
+              </div>
+            </div>
+            <div class="form-row" style="flex-direction:column;">
+              <div class="field"><label>What's New</label>
+                <textarea class="textarea" style="min-height:60px;" placeholder="Только для обновлений (1.0.1+)"></textarea>
+              </div>
+            </div>
+            <div class="checkbox-row"><span class="checkbox"></span> Отправлять What's New в Apple</div>
+            <div class="form-row">
+              <div class="field"><label>Support URL</label><input class="input" placeholder="https://example.com/support"></div>
+            </div>
+            <div class="form-row">
+              <div class="field"><label>Marketing URL</label><input class="input" placeholder="https://example.com"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">📱 App info</div>
+            <div class="form-row"><div class="field"><label>Name</label><input class="input" placeholder="App name"></div></div>
+            <div class="form-row"><div class="field"><label>Subtitle <span class="counter">· 0/30</span></label>
+              <div class="field-with-btn"><input class="input" placeholder="Subtitle"><button class="ai-mini-btn">✨</button></div>
+            </div></div>
+            <div class="form-row"><div class="field"><label>Copyright</label><input class="input" placeholder="© Your Developer Name"></div></div>
+            <div class="form-row"><div class="field"><label>Privacy Policy URL</label><input class="input" placeholder="https://example.com/privacy"></div></div>
+            <div class="form-row"><div class="field"><label>Primary Category</label>
+              <div class="field-with-btn"><select class="select"><option>Utilities (6002)</option></select><button class="ai-mini-btn">✨</button></div>
+            </div></div>
+            <div class="form-row"><div class="field"><label>Secondary Category</label>
+              <div class="field-with-btn"><select class="select"><option>Productivity (6007)</option></select><button class="ai-mini-btn">✨</button></div>
+            </div></div>
+            <div class="form-row"><div class="field"><label>Age rating default</label><input class="input" value="FIVE_AND_UNDER"></div></div>
+            <div class="form-row"><div class="field"><label>App availability</label>
+              <select class="select"><option>Все страны (Apple default)</option><option>Страны на выбор</option></select>
+            </div></div>
+            <div class="checkbox-row"><span class="checkbox"></span> Собираем данные (App Privacy)</div>
+          </div>
+        </div>
+
+        <!-- App Review + AI в две колонки -->
+        <div class="meta-grid-2col" style="margin-top:16px;">
+          <div class="card">
+            <div class="card-title">🔍 App Review notes</div>
+            <div class="form-row"><div class="field"><label>Contact first name</label><input class="input"></div></div>
+            <div class="form-row"><div class="field"><label>Contact last name</label><input class="input"></div></div>
+            <div class="form-row"><div class="field"><label>Contact phone</label><input class="input" placeholder="+1 555 010 0611"></div></div>
+            <div class="form-row"><div class="field"><label>Contact email</label><input class="input"></div></div>
+            <div class="form-row"><div class="field"><label>Notes</label><textarea class="textarea" style="min-height:70px;"></textarea></div></div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">🤖 AI генерация (AITUNNEL)</div>
+            <div class="form-row"><div class="field"><label>Developer name</label><input class="input" placeholder="Developer name для App Review"></div></div>
+            <div class="form-row"><div class="field"><label>ТЗ / brief приложения</label><textarea class="textarea" style="min-height:70px;" placeholder="Смысл приложения, функционал, аудитория..."></textarea></div></div>
+            <div class="form-row"><div class="field"><label>Prompt profile</label><select class="select"><option>Human premium ASO</option></select></div></div>
+            <div class="form-row"><div class="field"><label>Промт генерации</label><textarea class="textarea" style="min-height:90px;"></textarea></div></div>
+            <div style="display:flex;gap:8px;margin-bottom:10px;">
+              <button class="btn">📌 Профиль</button>
+              <button class="btn">💾 Сохранить</button>
+              <button class="btn">🧩 Стандартный</button>
+            </div>
+            <button class="btn-ai">✨ Сгенерировать все</button>
+            <div style="margin-top:12px;">
+              <div class="card-title" style="margin-bottom:8px;">Quick fixes</div>
+              <div class="grid-fix">
+                <button class="btn">🧼 Fix banned</button>
+                <button class="btn">➖ Remove dashes</button>
+                <button class="btn">📏 Shorten</button>
+                <button class="btn">🔡 Normalize</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">⚙ Дополнительно</div>
+          <div class="checkbox-row"><span class="checkbox checked"></span> После метаданных: TinyPNG → загрузка скринов</div>
+          <div class="form-row" style="margin-top:8px;"><div class="field"><label>Custom requests (JSON)</label><textarea class="textarea" style="min-height:60px;font-family:monospace;font-size:12px;" placeholder='[{"method":"PATCH","endpoint":"...","payload":{...}}]'></textarea></div></div>
+        </div>
+      </div>
+
+      <div class="exec-panel">
+        <h3>📊 Статус выполнения</h3>
+        <div class="sub">Прогресс задач и журнал операций</div>
+        <div class="progress"><div class="progress-fill" style="width:0%"></div></div>
+        <div class="log">
+          <div>Ожидание запуска...</div>
+        </div>
+        <button class="start-btn">▶ Применить метаданные</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="variant-label">Метаданные A · Двухколоночная верстка (контент | AI)</div>
+</div>
+
+<!-- ================================================================ -->
+<!-- МЕТАДАННЫЕ ВАРИАНТ B: Аккордеон-секции -->
+<!-- ================================================================ -->
+<div class="screen" id="metaB">
+<div class="app">
+  <div class="sidebar">
+    <div class="logo">🍏 PPO Automation</div>
+    <div class="nav-item"><span class="ico">✚</span> Новый тест</div>
+    <div class="nav-item"><span class="ico">↻</span> Обновить тест</div>
+    <div class="nav-item active"><span class="ico">📝</span> Метаданные</div>
+    <div class="nav-item"><span class="ico">🌐</span> Перевод локализации</div>
+    <div class="nav-item"><span class="ico">📸</span> Скриншоты</div>
+  </div>
+  <div class="main-area">
+    <div class="topbar">
+      <span class="badge-ok">● Готово</span>
+      <span class="summary">MyApp · v2.4.1 · App ID: 1234567890</span>
+      <button class="gear-btn">⚙ Настройки API</button>
+    </div>
+    <div class="content-row">
+      <div class="page section-accordion">
+        <div class="page-title">Метаданные приложения</div>
+        <div class="page-sub">Сворачиваемые секции — раскрывайте только нужные. Компактно для больших экранов.</div>
+
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="card-title" style="margin:0;">📡 Источник данных</span><span class="chevron">▼</span>
+          </div>
+          <div class="card-body" style="margin-top:14px;">
+            <div class="form-row">
+              <div class="field"><label>Локаль</label><select class="select"><option>English (en-US)</option></select></div>
+              <div class="field"><label>Версия</label><input class="input" value="2.4.1" readonly></div>
+              <div class="field" style="flex:0 0 auto;align-self:flex-end;"><button class="btn-primary" style="padding:9px 22px;border-radius:8px;border:none;font-size:14px;font-weight:700;cursor:pointer;">⬇ Pull</button></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="card-title" style="margin:0;">📋 Version metadata</span><span class="chevron">▼</span>
+          </div>
+          <div class="card-body" style="margin-top:14px;">
+            <div class="form-row"><div class="field"><label>Description <span class="counter">· 0/4000</span></label><textarea class="textarea" style="min-height:80px;" placeholder="Description"></textarea></div></div>
+            <div class="form-row"><div class="field"><label>Keywords <span class="counter">· 0/100</span></label><div class="field-with-btn"><input class="input" placeholder="keyword1,keyword2"><button class="ai-mini-btn">✨</button></div></div></div>
+            <div class="form-row"><div class="field"><label>Promotional text</label><textarea class="textarea" style="min-height:50px;"></textarea></div></div>
+            <div class="form-row"><div class="field"><label>What's New</label><textarea class="textarea" style="min-height:50px;"></textarea></div></div>
+            <div class="form-row"><div class="field"><label>Support URL</label><input class="input"></div><div class="field"><label>Marketing URL</label><input class="input"></div></div>
+          </div>
+        </div>
+
+        <div class="card collapsed">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="card-title" style="margin:0;">📱 App info</span><span class="chevron">▶</span>
+          </div>
+          <div class="card-body" style="margin-top:14px;">
+            <div class="form-row"><div class="field"><label>Name</label><input class="input"></div><div class="field"><label>Subtitle</label><input class="input"></div></div>
+            <div class="form-row"><div class="field"><label>Primary Category</label><select class="select"><option>Utilities (6002)</option></select></div><div class="field"><label>Secondary Category</label><select class="select"><option>Productivity (6007)</option></select></div></div>
+          </div>
+        </div>
+
+        <div class="card collapsed">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="card-title" style="margin:0;">🔍 App Review notes</span><span class="chevron">▶</span>
+          </div>
+          <div class="card-body" style="margin-top:14px;">
+            <div class="form-row"><div class="field"><label>Contact name</label><input class="input"></div><div class="field"><label>Contact phone</label><input class="input"></div></div>
+            <div class="form-row"><div class="field"><label>Notes</label><textarea class="textarea"></textarea></div></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="card-title" style="margin:0;">🤖 AI генерация (AITUNNEL)</span><span class="chevron">▼</span>
+          </div>
+          <div class="card-body" style="margin-top:14px;">
+            <div class="form-row"><div class="field"><label>ТЗ / brief приложения</label><textarea class="textarea" style="min-height:70px;" placeholder="Смысл приложения, функционал..."></textarea></div></div>
+            <div class="form-row"><div class="field"><label>Промт генерации</label><textarea class="textarea" style="min-height:80px;"></textarea></div></div>
+            <button class="btn-ai" style="margin-top:8px;">✨ Сгенерировать все</button>
+            <div class="grid-fix" style="margin-top:10px;">
+              <button class="btn">🧼 Fix banned</button>
+              <button class="btn">📏 Shorten</button>
+              <button class="btn">🔡 Normalize</button>
+              <button class="btn">➖ Remove dashes</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="exec-panel">
+        <h3>📊 Статус выполнения</h3>
+        <div class="sub">Прогресс и журнал</div>
+        <div class="progress"><div class="progress-fill" style="width:0%"></div></div>
+        <div class="log"><div>Ожидание...</div></div>
+        <button class="start-btn">▶ Применить метаданные</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="variant-label">Метаданные B · Аккордеон (сворачиваемые секции)</div>
+</div>
+
+<!-- ================================================================ -->
+<!-- МЕТАДАННЫЕ ВАРИАНТ C: Форма + AI рейл справа -->
+<!-- ================================================================ -->
+<div class="screen" id="metaC">
+<div class="app">
+  <div class="sidebar">
+    <div class="logo">🍏 PPO Automation</div>
+    <div class="nav-item"><span class="ico">✚</span> Новый тест</div>
+    <div class="nav-item"><span class="ico">↻</span> Обновить тест</div>
+    <div class="nav-item active"><span class="ico">📝</span> Метаданные</div>
+    <div class="nav-item"><span class="ico">🌐</span> Перевод локализации</div>
+    <div class="nav-item"><span class="ico">📸</span> Скриншоты</div>
+  </div>
+  <div class="main-area">
+    <div class="topbar">
+      <span class="badge-ok">● Готово</span>
+      <span class="summary">MyApp · v2.4.1 · App ID: 1234567890</span>
+      <button class="gear-btn">⚙ Настройки API</button>
+    </div>
+    <div class="content-row">
+      <div class="page">
+        <div class="page-title">Метаданные приложения</div>
+        <div class="page-sub">Все поля в одну колонку (широко), AI-инструменты — в отдельном рейле справа всегда под рукой.</div>
+
+        <div class="layout-with-ai-rail">
+          <!-- Левая колонка: все поля -->
+          <div>
+            <div class="card">
+              <div class="card-title">📡 Источник</div>
+              <div class="form-row">
+                <div class="field"><label>Локаль</label><select class="select"><option>English (en-US)</option></select></div>
+                <div class="field"><label>Версия</label><input class="input" value="2.4.1" readonly></div>
+                <div class="field" style="flex:0 0 auto;align-self:flex-end;"><button class="btn-primary" style="padding:9px 22px;border-radius:8px;border:none;font-size:14px;font-weight:700;cursor:pointer;">⬇ Pull</button></div>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-title">📋 Version metadata</div>
+              <div class="form-row"><div class="field"><label>Description <span class="counter">· 0/4000</span></label><textarea class="textarea" style="min-height:90px;" placeholder="Description"></textarea></div></div>
+              <div class="form-row"><div class="field"><label>Keywords <span class="counter">· 0/100</span></label><div class="field-with-btn"><input class="input" placeholder="keyword1,keyword2"><button class="ai-mini-btn">✨ AI</button></div></div></div>
+              <div class="form-row"><div class="field"><label>Promotional text</label><textarea class="textarea" style="min-height:50px;"></textarea></div></div>
+              <div class="form-row"><div class="field"><label>What's New</label><textarea class="textarea" style="min-height:50px;"></textarea></div></div>
+              <div class="form-row"><div class="field"><label>Support URL</label><input class="input"></div><div class="field"><label>Marketing URL</label><input class="input"></div></div>
+            </div>
+            <div class="card">
+              <div class="card-title">📱 App info</div>
+              <div class="form-row"><div class="field"><label>Name</label><input class="input"></div><div class="field"><label>Subtitle</label><input class="input"></div></div>
+              <div class="form-row"><div class="field"><label>Copyright</label><input class="input"></div><div class="field"><label>Privacy Policy URL</label><input class="input"></div></div>
+              <div class="form-row"><div class="field"><label>Primary Category</label><select class="select"><option>Utilities (6002)</option></select></div><div class="field"><label>Secondary Category</label><select class="select"><option>Productivity (6007)</option></select></div></div>
+            </div>
+            <div class="card">
+              <div class="card-title">🔍 App Review notes</div>
+              <div class="form-row"><div class="field"><label>Contact first name</label><input class="input"></div><div class="field"><label>Contact last name</label><input class="input"></div></div>
+              <div class="form-row"><div class="field"><label>Contact phone</label><input class="input"></div><div class="field"><label>Contact email</label><input class="input"></div></div>
+              <div class="form-row"><div class="field"><label>Notes</label><textarea class="textarea" style="min-height:60px;"></textarea></div></div>
+            </div>
+          </div>
+
+          <!-- Правый рейл: AI инструменты (всегда видны) -->
+          <div class="ai-rail">
+            <div class="card">
+              <div class="card-title">🤖 AI генерация</div>
+              <div class="form-row" style="flex-direction:column;"><div class="field"><label>Developer name</label><input class="input"></div></div>
+              <div class="form-row" style="flex-direction:column;"><div class="field"><label>ТЗ / brief</label><textarea class="textarea" style="min-height:60px;"></textarea></div></div>
+              <div class="form-row" style="flex-direction:column;"><div class="field"><label>Prompt profile</label><select class="select"><option>Human premium ASO</option></select></div></div>
+              <button class="btn-ai" style="margin-top:6px;">✨ Сгенерировать все</button>
+            </div>
+            <div class="card">
+              <div class="card-title">⚡ Quick fixes</div>
+              <div class="grid-fix">
+                <button class="btn">🧼 Banned</button>
+                <button class="btn">📏 Shorten</button>
+                <button class="btn">🔡 Normalize</button>
+                <button class="btn">➖ Dashes</button>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-title">⚙ Дополнительно</div>
+              <div class="checkbox-row"><span class="checkbox checked"></span> Chain screenshots</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="exec-panel">
+        <h3>📊 Статус</h3>
+        <div class="sub">Прогресс и журнал</div>
+        <div class="progress"><div class="progress-fill" style="width:0%"></div></div>
+        <div class="log"><div>Ожидание...</div></div>
+        <button class="start-btn">▶ Применить</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="variant-label">Метаданные C · Форма + AI рейл (инструменты всегда видны)</div>
+</div>
+
+<!-- ================================================================ -->
+<!-- НАСТРОЙКИ API ВАРИАНТ A: Модальное окно поверх -->
+<!-- ================================================================ -->
+<div class="screen" id="apiA">
+<div class="app">
+  <div class="sidebar">
+    <div class="logo">🍏 PPO Automation</div>
+    <div class="nav-item"><span class="ico">✚</span> Новый тест</div>
+    <div class="nav-item active"><span class="ico">📝</span> Метаданные</div>
+    <div class="nav-item"><span class="ico">🌐</span> Перевод</div>
+    <div class="nav-item"><span class="ico">📸</span> Скриншоты</div>
+  </div>
+  <div class="main-area">
+    <div class="topbar">
+      <span class="badge-ok">● Готово</span>
+      <span class="summary">MyApp · v2.4.1 · App ID: 1234567890</span>
+      <button class="gear-btn" style="background:linear-gradient(135deg,#a855f7,#6366f1);color:#fff;border:none;">⚙ Настройки API</button>
+    </div>
+    <div class="content-row">
+      <div class="page" style="position:relative;filter:blur(2px);opacity:.4;">
+        <div class="page-title">Метаданные приложения</div>
+        <div class="card"><div class="card-title">📋 Version metadata</div><textarea class="textarea"></textarea></div>
+      </div>
+    </div>
+  </div>
+</div>
+<!-- Модальное окно настроек API -->
+<div style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:100;width:680px;max-height:85vh;overflow-y:auto;background:#14142a;border:1px solid #2a2a45;border-radius:16px;box-shadow:0 24px 64px rgba(0,0,0,.6);">
+  <div style="padding:20px 24px;border-bottom:1px solid #2a2a45;display:flex;align-items:center;justify-content:between;">
+    <span style="font-size:18px;font-weight:800;color:#fff;">⚙ Настройки API</span>
+    <span style="margin-left:auto;color:#6b7280;cursor:pointer;font-size:20px;">✕</span>
+  </div>
+  <div style="padding:20px 24px;">
+    <div class="card-title" style="margin-bottom:10px;">🍎 App Store Connect</div>
+    <div class="form-row"><div class="field"><label>Issuer ID</label><input class="input" value="••••••••-••••-••••"></div><div class="field"><label>Key ID</label><input class="input" value="ABCDE12345"></div></div>
+    <div class="form-row"><div class="field"><label>App ID</label><div class="field-with-btn"><input class="input" value="1234567890"><button class="btn">Загрузить</button></div></div></div>
+    <div class="form-row"><div class="field"><label>Private key (.p8)</label><div class="field-with-btn"><input class="input" value="/path/AuthKey_X.p8"><button class="btn">Выбрать</button></div></div></div>
+    <hr style="border:none;border-top:1px solid #2a2a45;margin:16px 0;">
+    <div class="card-title" style="margin-bottom:10px;">🖼 TinyPNG</div>
+    <div class="form-row"><div class="field"><label>API key</label><input class="input" type="password" value="••••••••"></div></div>
+    <hr style="border:none;border-top:1px solid #2a2a45;margin:16px 0;">
+    <div class="card-title" style="margin-bottom:10px;">🤖 AITUNNEL (AI генерация + перевод)</div>
+    <div class="form-row"><div class="field"><label>API key</label><input class="input" type="password" value="••••••••"></div></div>
+    <div class="form-row"><div class="field"><label>Модель</label><div class="field-with-btn"><select class="select"><option>gemini-2.5-flash</option></select><button class="btn">↻ Модели</button></div></div></div>
+    <hr style="border:none;border-top:1px solid #2a2a45;margin:16px 0;">
+    <div class="card-title" style="margin-bottom:10px;">📋 Jira Cloud</div>
+    <div class="form-row"><div class="field"><label>Base URL</label><input class="input" value="https://company.atlassian.net"></div><div class="field"><label>Email</label><input class="input"></div></div>
+    <div class="form-row"><div class="field"><label>API Token</label><input class="input" type="password"></div></div>
+    <div class="form-row"><div class="field" style="flex:0 0 140px;"><label>Project</label><input class="input" value="APP"></div><div class="field" style="flex:0 0 120px;"><label>Type</label><input class="input" value="Story"></div></div>
+    <div style="display:flex;gap:10px;margin-top:20px;">
+      <button class="btn-primary" style="flex:1;padding:12px;border-radius:10px;border:none;font-size:15px;font-weight:700;cursor:pointer;">💾 Сохранить</button>
+      <button class="btn" style="padding:12px 24px;">Отмена</button>
+    </div>
+  </div>
+</div>
+<div class="variant-label">API A · Модальное окно (поверх приложения)</div>
+</div>
+
+<!-- ================================================================ -->
+<!-- НАСТРОЙКИ API ВАРИАНТ B: Отдельная вкладка в sidebar -->
+<!-- ================================================================ -->
+<div class="screen" id="apiB">
+<div class="app">
+  <div class="sidebar">
+    <div class="logo">🍏 PPO Automation</div>
+    <div class="nav-item"><span class="ico">✚</span> Новый тест</div>
+    <div class="nav-item"><span class="ico">📝</span> Метаданные</div>
+    <div class="nav-item"><span class="ico">🌐</span> Перевод</div>
+    <div class="nav-item"><span class="ico">📸</span> Скриншоты</div>
+    <div style="height:1px;background:#2a2a45;margin:12px 0;"></div>
+    <div class="nav-item active"><span class="ico">⚙</span> Настройки API</div>
+  </div>
+  <div class="main-area">
+    <div class="topbar">
+      <span class="badge-ok">● Готово</span>
+      <span class="summary">MyApp · v2.4.1 · App ID: 1234567890</span>
+    </div>
+    <div class="content-row">
+      <div class="page">
+        <div class="page-title">⚙ Настройки API</div>
+        <div class="page-sub">Все ключи и интеграции в одном месте. Сохраняются в .env автоматически.</div>
+
+        <div class="meta-grid-2col">
+          <div class="card">
+            <div class="card-title">🍎 App Store Connect</div>
+            <div class="form-row"><div class="field"><label>Issuer ID</label><input class="input"></div><div class="field"><label>Key ID</label><input class="input"></div></div>
+            <div class="form-row"><div class="field"><label>App ID</label><div class="field-with-btn"><input class="input"><button class="btn">Загрузить</button></div></div></div>
+            <div class="form-row"><div class="field"><label>Private key (.p8)</label><div class="field-with-btn"><input class="input"><button class="btn">Выбрать</button></div></div></div>
+          </div>
+          <div class="card">
+            <div class="card-title">🤖 AITUNNEL</div>
+            <div class="form-row"><div class="field"><label>API key</label><input class="input" type="password"></div></div>
+            <div class="form-row"><div class="field"><label>Модель</label><div class="field-with-btn"><select class="select"><option>gemini-2.5-flash</option></select><button class="btn">↻</button></div></div></div>
+            <div style="margin-top:8px;"><span class="pill">Используется для: генерация метаданных + перевод локализации</span></div>
+          </div>
+        </div>
+        <div class="meta-grid-2col" style="margin-top:16px;">
+          <div class="card">
+            <div class="card-title">🖼 TinyPNG</div>
+            <div class="form-row"><div class="field"><label>API key (сжатие скринов)</label><input class="input" type="password"></div></div>
+          </div>
+          <div class="card">
+            <div class="card-title">📋 Jira Cloud</div>
+            <div class="form-row"><div class="field"><label>Base URL</label><input class="input"></div><div class="field"><label>Email</label><input class="input"></div></div>
+            <div class="form-row"><div class="field"><label>API Token</label><input class="input" type="password"></div></div>
+            <div class="form-row"><div class="field" style="flex:0 0 140px;"><label>Project</label><input class="input"></div><div class="field" style="flex:0 0 120px;"><label>Type</label><input class="input"></div></div>
+          </div>
+        </div>
+        <button class="btn-primary" style="margin-top:16px;padding:13px 32px;border-radius:10px;border:none;font-size:15px;font-weight:700;cursor:pointer;">💾 Сохранить в .env</button>
+      </div>
+      <div class="exec-panel">
+        <h3>📊 Статус</h3>
+        <div class="sub">Прогресс и журнал</div>
+        <div class="progress"><div class="progress-fill" style="width:0%"></div></div>
+        <div class="log"><div>Ожидание...</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="variant-label">API B · Отдельная вкладка в sidebar (постоянный экран)</div>
+</div>
+
+<script>
+function showScreen(id, btn) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.switcher button').forEach(b => b.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
+}
+function toggleCard(header) {
+  const card = header.parentElement;
+  card.classList.toggle('collapsed');
+  const chevron = header.querySelector('.chevron');
+  chevron.textContent = card.classList.contains('collapsed') ? '▶' : '▼';
+}
+</script>
+</body>
+</html>

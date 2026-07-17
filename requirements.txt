@@ -1,4 +1,6 @@
-PySide6
-requests
+Pillow
 PyJWT
+PySide6
+PyYAML
 python-dotenv
+requests

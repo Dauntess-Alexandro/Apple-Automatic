@@ -1,0 +1,992 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PPO Automation — Мокапы: Метаданные</title>
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #0d0d18;
+    --card: #14142a;
+    --border: #2a2a45;
+    --text: #e8e8f0;
+    --muted: #9ca3af;
+    --hint: #6b7280;
+    --label: #c4b5fd;
+    --accent: #a855f7;
+    --accent2: #6366f1;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --sidebar-w: 210px;
+    --exec-w: 340px;
+    --switcher-h: 58px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
+
+  /* Switcher */
+  .switcher {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 2000;
+    height: var(--switcher-h);
+    background: #06060d; border-bottom: 1px solid var(--border);
+    padding: 0 20px; display: flex; gap: 8px; align-items: center; overflow-x: auto;
+  }
+  .switcher-title { color: #fff; font-weight: 800; font-size: 13px; white-space: nowrap; margin-right: 8px; }
+  .switcher button {
+    background: #1a1a2e; color: var(--muted); border: 1px solid var(--border);
+    padding: 7px 14px; border-radius: 8px; cursor: pointer; font-size: 12px; font-weight: 600;
+    white-space: nowrap; transition: .15s;
+  }
+  .switcher button:hover { color: var(--label); background: #222238; }
+  .switcher button.active { background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; border-color: transparent; }
+  .switcher .spacer { margin-left: auto; }
+  .switcher .kbd { font-size: 11px; color: var(--hint); }
+
+  .screen { display: none; padding-top: var(--switcher-h); min-height: 100vh; }
+  .screen.active { display: flex; flex-direction: column; }
+
+  /* App shell */
+  .app { display: flex; flex: 1; min-height: calc(100vh - var(--switcher-h)); }
+  .sidebar {
+    width: var(--sidebar-w); background: var(--surface); border-right: 1px solid var(--border);
+    padding: 16px 10px; flex-shrink: 0;
+  }
+  .logo { color: #fff; font-size: 15px; font-weight: 800; padding: 4px 8px; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+  .logo-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--ok); }
+  .nav-item {
+    display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 8px;
+    color: var(--muted); font-size: 13px; font-weight: 600; cursor: pointer; margin-bottom: 2px;
+    border-left: 3px solid transparent;
+  }
+  .nav-item:hover { background: rgba(168,85,247,.08); color: var(--label); }
+  .nav-item.active {
+    background: linear-gradient(90deg, rgba(168,85,247,.2), transparent);
+    border-left-color: var(--accent); color: #fff;
+  }
+  .nav-sep { height: 1px; background: var(--border); margin: 10px 8px; }
+
+  .main-area { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .topbar {
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    padding: 8px 20px; display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+  }
+  .badge { font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 20px; }
+  .badge-ok { background: rgba(74,222,128,.12); color: var(--ok); }
+  .topbar-summary { font-size: 12px; color: var(--muted); }
+  .content-row { flex: 1; display: flex; min-height: 0; }
+
+  .page { flex: 1; overflow-y: auto; padding: 20px 24px 88px; min-width: 0; }
+  .page-title { font-size: 20px; font-weight: 800; color: #fff; margin-bottom: 4px; }
+  .page-sub { font-size: 12px; color: var(--hint); margin-bottom: 16px; line-height: 1.5; max-width: 720px; }
+
+  /* Exec panel */
+  .exec-panel {
+    width: var(--exec-w); background: var(--card); border-left: 1px solid var(--border);
+    border-top: 3px solid var(--accent); padding: 14px; display: flex; flex-direction: column; gap: 8px;
+    flex-shrink: 0;
+  }
+  .exec-panel h3 { font-size: 13px; font-weight: 700; color: var(--label); }
+  .exec-panel .sub { font-size: 11px; color: var(--hint); margin-bottom: 4px; }
+  .progress { height: 26px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent2), var(--accent)); border-radius: 8px; }
+  .progress-meta { display: flex; justify-content: space-between; font-size: 11px; color: var(--hint); }
+  .log {
+    flex: 1; min-height: 180px; background: #06060d; border: 1px solid #1e1e35; border-radius: 10px;
+    padding: 10px; font-family: "SF Mono", Menlo, monospace; font-size: 11px; color: #a78bfa;
+    overflow-y: auto; line-height: 1.55;
+  }
+  .log .err { color: #f87171; }
+  .log .ok { color: var(--ok); }
+
+  /* Form elements */
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+  .card-title {
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px;
+    color: var(--accent); margin-bottom: 12px;
+  }
+  .card-title-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .card-title-row .card-title { margin: 0; }
+  .field { margin-bottom: 10px; }
+  .field:last-child { margin-bottom: 0; }
+  .field label { display: flex; justify-content: space-between; font-size: 11px; font-weight: 600; color: var(--label); margin-bottom: 5px; }
+  .counter { color: var(--hint); font-weight: 500; }
+  .counter.warn { color: var(--warn); }
+  .input, .textarea, .select {
+    width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 11px; color: #f0f0ff; font-size: 13px; font-family: inherit;
+  }
+  .textarea { resize: vertical; min-height: 56px; line-height: 1.45; }
+  .input:focus, .textarea:focus, .select:focus { outline: none; border-color: var(--accent); }
+  .form-row { display: flex; gap: 12px; }
+  .form-row .field { flex: 1; }
+
+  .btn {
+    padding: 8px 14px; border-radius: 8px; font-size: 12px; font-weight: 700; cursor: pointer;
+    border: 1px solid var(--border); background: #1a1a2e; color: var(--label);
+  }
+  .btn:hover { background: #222238; }
+  .btn-primary {
+    background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; border: none;
+  }
+  .btn-ai { background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; border: none; width: 100%; padding: 11px; font-size: 13px; }
+  .btn-sm { padding: 6px 10px; font-size: 11px; }
+  .ai-chip {
+    background: rgba(168,85,247,.12); border: 1px solid rgba(168,85,247,.4); color: var(--label);
+    padding: 5px 9px; border-radius: 6px; font-size: 10px; font-weight: 700; cursor: pointer;
+  }
+  .ai-chip:hover { background: rgba(168,85,247,.25); }
+  .field-row { display: flex; gap: 6px; align-items: flex-start; }
+  .field-row .input, .field-row .textarea, .field-row .select { flex: 1; }
+
+  .checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); padding: 4px 0; }
+  .cb { width: 16px; height: 16px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); flex-shrink: 0; }
+  .cb.on { background: var(--accent); border-color: #c084fc; position: relative; }
+  .cb.on::after { content: ""; position: absolute; left: 4px; top: 1px; width: 5px; height: 9px; border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg); }
+
+  .toolbar {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 14px; margin-bottom: 14px;
+  }
+  .toolbar .field { margin: 0; flex: 1; min-width: 140px; }
+  .toolbar .field label { font-size: 10px; }
+  .toolbar-actions { display: flex; gap: 8px; align-items: flex-end; flex-shrink: 0; }
+
+  .sticky-footer {
+    position: fixed; bottom: 0; left: var(--sidebar-w); right: var(--exec-w);
+    background: rgba(10,10,15,.92); backdrop-filter: blur(12px);
+    border-top: 1px solid var(--border); padding: 12px 24px; z-index: 100;
+  }
+  .sticky-footer .btn-upload {
+    width: 100%; padding: 13px; border-radius: 10px; border: none; cursor: pointer;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    color: #fff; font-size: 14px; font-weight: 800; letter-spacing: .3px;
+  }
+
+  .variant-badge {
+    position: fixed; bottom: 72px; right: calc(var(--exec-w) + 16px); z-index: 150;
+    padding: 8px 14px; border-radius: 20px; font-size: 11px; font-weight: 700;
+    background: rgba(0,0,0,.75); color: var(--label); border: 1px solid var(--border);
+    max-width: 280px; line-height: 1.4;
+  }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .grid-fix { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+
+  /* Variant-specific */
+  .ai-rail-layout { display: grid; grid-template-columns: 1fr 280px; gap: 14px; align-items: start; }
+  .ai-rail { position: sticky; top: 0; }
+
+  .inner-tabs { display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid var(--border); padding-bottom: 0; }
+  .inner-tab {
+    padding: 10px 16px; font-size: 12px; font-weight: 700; color: var(--muted); cursor: pointer;
+    border-bottom: 2px solid transparent; margin-bottom: -1px; transition: .15s;
+  }
+  .inner-tab:hover { color: var(--label); }
+  .inner-tab.active { color: #fff; border-bottom-color: var(--accent); }
+  .inner-tab .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); margin-left: 6px; vertical-align: middle; }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+
+  .accordion .acc-item { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 8px; overflow: hidden; background: var(--card); }
+  .acc-header {
+    display: flex; align-items: center; justify-content: space-between; padding: 12px 14px;
+    cursor: pointer; user-select: none;
+  }
+  .acc-header:hover { background: rgba(168,85,247,.05); }
+  .acc-header .title { font-size: 13px; font-weight: 700; color: #fff; }
+  .acc-header .meta { font-size: 11px; color: var(--hint); }
+  .acc-header .chev { color: var(--hint); font-size: 11px; }
+  .acc-body { padding: 0 14px 14px; display: none; }
+  .acc-item.open .acc-body { display: block; }
+  .acc-item.open .chev { transform: rotate(180deg); }
+  .status-pill { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 10px; }
+  .status-pill.done { background: rgba(74,222,128,.12); color: var(--ok); }
+  .status-pill.empty { background: rgba(156,163,175,.1); color: var(--hint); }
+  .status-pill.partial { background: rgba(251,191,36,.12); color: var(--warn); }
+
+  .stepper { display: flex; gap: 0; margin-bottom: 18px; }
+  .step {
+    flex: 1; text-align: center; padding: 10px 8px; position: relative;
+    font-size: 11px; font-weight: 700; color: var(--hint); cursor: pointer;
+  }
+  .step::after {
+    content: ""; position: absolute; top: 18px; left: 50%; width: 100%; height: 2px;
+    background: var(--border); z-index: 0;
+  }
+  .step:last-child::after { display: none; }
+  .step-num {
+    display: inline-flex; width: 28px; height: 28px; border-radius: 50%; align-items: center; justify-content: center;
+    background: var(--surface); border: 2px solid var(--border); margin-bottom: 6px; position: relative; z-index: 1;
+    font-size: 12px;
+  }
+  .step.active .step-num { border-color: var(--accent); background: rgba(168,85,247,.2); color: #fff; }
+  .step.done .step-num { border-color: var(--ok); background: rgba(74,222,128,.15); color: var(--ok); }
+  .step.active { color: #fff; }
+  .step-pane { display: none; }
+  .step-pane.active { display: block; }
+  .step-nav { display: flex; justify-content: space-between; margin-top: 16px; }
+
+  .editor-layout { display: grid; grid-template-columns: 180px 1fr 260px; gap: 12px; align-items: start; }
+  .field-nav {
+    position: sticky; top: 0; background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 10px; font-size: 11px;
+  }
+  .field-nav .nav-title { font-weight: 700; color: var(--label); margin-bottom: 8px; font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
+  .field-nav a {
+    display: block; padding: 7px 8px; border-radius: 6px; color: var(--muted); text-decoration: none;
+    cursor: pointer; margin-bottom: 2px;
+  }
+  .field-nav a:hover { background: rgba(168,85,247,.08); color: var(--label); }
+  .field-nav a.active { background: rgba(168,85,247,.15); color: #fff; }
+  .field-nav .section { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
+  .editor-main .field.focused { border-left: 3px solid var(--accent); padding-left: 12px; margin-left: -12px; }
+
+  .split-content { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .mini-stat { font-size: 10px; color: var(--hint); margin-top: 2px; }
+
+  @media (max-width: 1200px) {
+    .ai-rail-layout, .editor-layout, .split-content, .grid-2 { grid-template-columns: 1fr; }
+    .sticky-footer { right: 0; }
+    .variant-badge { right: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="switcher">
+  <span class="switcher-title">Метаданные — мокапы</span>
+  <button class="active" onclick="show('v0', this)">0 · Как сейчас</button>
+  <button onclick="show('v1', this)">1 · AI Rail Pro</button>
+  <button onclick="show('v2', this)">2 · Внутренние вкладки</button>
+  <button onclick="show('v3', this)">3 · Аккордеон</button>
+  <button onclick="show('v4', this)">4 · Мастер-шаги</button>
+  <button onclick="show('v5', this)">5 · Редактор + навигация</button>
+  <span class="spacer"></span>
+  <span class="kbd">← переключайте варианты</span>
+</div>
+
+<!-- Shared fragments via template approach - each screen is self-contained -->
+
+<!-- ========== V0: Current layout ========== -->
+<div class="screen active" id="v0">
+<div class="app">
+  <aside class="sidebar">
+    <div class="logo"><span class="logo-dot"></span> PPO Automation</div>
+    <div class="nav-item">+ Новый тест</div>
+    <div class="nav-item">Обновить тест</div>
+    <div class="nav-item active">Метаданные</div>
+    <div class="nav-item">Перевод локали</div>
+    <div class="nav-item">Скриншоты</div>
+    <div class="nav-sep"></div>
+    <div class="nav-item">Настройки API</div>
+  </aside>
+  <div class="main-area">
+    <div class="topbar">
+      <span class="badge badge-ok">Готово к запуску</span>
+      <span class="topbar-summary">App ID: 6784998215</span>
+    </div>
+    <div class="content-row">
+      <div class="page">
+        <h1 class="page-title">Метаданные приложения</h1>
+        <p class="page-sub">Заполните поля ниже — программа соберёт payload для App Store Connect. JSON оставлен только для продвинутых custom_requests.</p>
+
+        <div class="ai-rail-layout">
+          <div>
+            <div class="card">
+              <div class="card-title">Источник данных</div>
+              <div class="form-row">
+                <div class="field"><label>Локаль: загрузка…</label></div>
+                <div class="field"><label>Версия: загрузка…</label></div>
+                <div class="toolbar-actions"><button class="btn btn-primary btn-sm">Pull</button></div>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-title">Локаль</div>
+              <div class="form-row">
+                <div class="field"><label>Язык</label><select class="select"><option>English (U.S.) (en-US)</option></select></div>
+                <div class="field"><label>Версия</label><input class="input" placeholder="Версия из App Store Connect" readonly></div>
+              </div>
+            </div>
+            <div class="toolbar" style="margin-bottom:12px;">
+              <div class="field" style="max-width:120px;"><label>Issue</label><input class="input" value="T7-1586"></div>
+              <button class="btn btn-primary">Обновить карточку Jira</button>
+              <span style="font-size:11px;color:var(--hint);">Записывает метаданные в Jira</span>
+            </div>
+            <div class="card">
+              <div class="card-title">Version metadata</div>
+              <div class="field"><label>Description</label><textarea class="textarea" style="min-height:100px;"></textarea></div>
+              <div class="field"><label>Keywords</label><div class="field-row"><input class="input"><button class="ai-chip">AI</button></div></div>
+              <div class="field"><label>Promotional text</label><textarea class="textarea"></textarea></div>
+              <div class="field"><label>What's New</label><textarea class="textarea"></textarea></div>
+              <div class="checkbox-row"><span class="cb"></span> Отправлять What's New в Apple</div>
+              <div class="form-row">
+                <div class="field"><label>Support URL</label><input class="input"></div>
+                <div class="field"><label>Marketing URL</label><input class="input"></div>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-title">App info</div>
+              <div class="form-row">
+                <div class="field"><label>Name</label><input class="input"></div>
+                <div class="field"><label>Subtitle</label><input class="input"></div>
+              </div>
+              <div class="form-row">
+                <div class="field"><label>Primary Category</label><select class="select"><option>Utilities (6002)</option></select></div>
+                <div class="field"><label>Secondary Category</label><select class="select"><option>—</option></select></div>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-title">App Review notes</div>
+              <div class="form-row">
+                <div class="field"><label>First name</label><input class="input"></div>
+                <div class="field"><label>Last name</label><input class="input"></div>
+              </div>
+              <div class="field"><label>Notes</label><textarea class="textarea"></textarea></div>
+            </div>
+          </div>
+          <div class="ai-rail">
+            <div class="card">
+              <div class="card-title">AI генерация (AITUNNEL)</div>
+              <div class="field"><label>Developer name</label><input class="input"></div>
+              <div class="field"><label>ТЗ / brief приложения</label><textarea class="textarea" style="min-height:80px;"></textarea></div>
+              <div class="field"><label>Prompt profile</label><select class="select"><option>Human premium ASO</option></select></div>
+              <div class="field"><label>Промт генерации</label><textarea class="textarea" style="min-height:120px;font-size:11px;">You are an expert ASO copywriter...</textarea></div>
+              <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap;">
+                <button class="btn btn-sm">Применить профиль</button>
+                <button class="btn btn-sm">Сохранить</button>
+              </div>
+              <button class="btn-ai">Сгенерировать</button>
+            </div>
+            <div class="card">
+              <div class="card-title">Fix with AI</div>
+              <div class="grid-fix">
+                <button class="btn btn-sm">Fix banned words</button>
+                <button class="btn btn-sm">Shorten to limits</button>
+                <button class="btn btn-sm">Remove dashes</button>
+                <button class="btn btn-sm">Normalize keywords</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <aside class="exec-panel">
+        <h3>Статус выполнения</h3>
+        <p class="sub">Прогресс задач и журнал операций</p>
+        <div class="progress-meta"><span>0%</span><span>Осталось: --:--</span></div>
+        <div class="progress"><div class="progress-fill" style="width:0%"></div></div>
+        <div class="log">
+          <div class="err">Не найден .p8: /Users/.../AuthKey.p8</div>
+          <div class="err">Не удалось получить данные из App Store Connect</div>
+          <div>Ожидание запуска...</div>
+        </div>
+      </aside>
+    </div>
+    <div class="sticky-footer"><button class="btn-upload">ЗАГРУЗИТЬ МЕТАДАННЫЕ ПРИЛОЖЕНИЯ</button></div>
+  </div>
+</div>
+<div class="variant-badge">Вариант 0 · Текущая верстка (плотная, всё в одном скролле)</div>
+</div>
+
+<!-- ========== V1: AI Rail Pro ========== -->
+<div class="screen" id="v1">
+<div class="app">
+  <aside class="sidebar">
+    <div class="logo"><span class="logo-dot"></span> PPO Automation</div>
+    <div class="nav-item">+ Новый тест</div>
+    <div class="nav-item">Обновить тест</div>
+    <div class="nav-item active">Метаданные</div>
+    <div class="nav-item">Перевод локали</div>
+    <div class="nav-item">Скриншоты</div>
+    <div class="nav-sep"></div>
+    <div class="nav-item">Настройки API</div>
+  </aside>
+  <div class="main-area">
+    <div class="topbar">
+      <span class="badge badge-ok">Готово к запуску</span>
+      <span class="topbar-summary">en-US · App ID 6784998215</span>
+    </div>
+    <div class="content-row">
+      <div class="page">
+        <h1 class="page-title">Метаданные приложения</h1>
+        <p class="page-sub">Компактная панель источника сверху, контент слева, AI всегда виден справа.</p>
+
+        <!-- Compact toolbar -->
+        <div class="toolbar">
+          <div class="field" style="max-width:160px;"><label>Локаль</label><select class="select"><option>English (U.S.) en-US</option></select></div>
+          <div class="field" style="max-width:120px;"><label>Версия</label><input class="input" value="1.0.0" readonly></div>
+          <div class="field" style="max-width:100px;"><label>Jira Issue</label><input class="input" value="T7-1586"></div>
+          <div class="toolbar-actions">
+            <button class="btn btn-sm">Pull from Apple</button>
+            <button class="btn btn-primary btn-sm">Jira</button>
+          </div>
+        </div>
+
+        <div class="ai-rail-layout">
+          <div>
+            <div class="card">
+              <div class="card-title-row">
+                <span class="card-title">Version metadata</span>
+                <button class="btn btn-sm">AI: заполнить секцию</button>
+              </div>
+              <div class="field">
+                <label>Description <span class="counter">0 / 4000</span></label>
+                <div class="field-row"><textarea class="textarea" style="min-height:110px;" placeholder="Описание приложения для App Store"></textarea><button class="ai-chip">AI</button></div>
+              </div>
+              <div class="grid-2">
+                <div class="field">
+                  <label>Keywords <span class="counter warn">102 / 100</span></label>
+                  <div class="field-row"><input class="input" value="vpn,proxy,secure"><button class="ai-chip">AI</button></div>
+                </div>
+                <div class="field">
+                  <label>Promotional text <span class="counter">0 / 170</span></label>
+                  <textarea class="textarea" style="min-height:56px;"></textarea>
+                </div>
+              </div>
+              <div class="field">
+                <label>What's New</label>
+                <textarea class="textarea" style="min-height:64px;" placeholder="Только для обновлений 1.0.1+"></textarea>
+                <div class="checkbox-row" style="margin-top:6px;"><span class="cb"></span> Отправлять What's New</div>
+              </div>
+              <div class="form-row">
+                <div class="field"><label>Support URL</label><input class="input" placeholder="https://"></div>
+                <div class="field"><label>Marketing URL</label><input class="input" placeholder="https://"></div>
+              </div>
+            </div>
+
+            <div class="split-content">
+              <div class="card" style="margin:0;">
+                <div class="card-title">App info</div>
+                <div class="field"><label>Name</label><input class="input"></div>
+                <div class="field"><label>Subtitle <span class="counter">0 / 30</span></label><div class="field-row"><input class="input"><button class="ai-chip">AI</button></div></div>
+                <div class="form-row">
+                  <div class="field"><label>Primary</label><select class="select"><option>Utilities</option></select></div>
+                  <div class="field"><label>Secondary</label><select class="select"><option>—</option></select></div>
+                </div>
+                <div class="field"><label>Privacy Policy URL</label><input class="input"></div>
+              </div>
+              <div class="card" style="margin:0;">
+                <div class="card-title">App Review</div>
+                <div class="form-row">
+                  <div class="field"><label>First name</label><input class="input"></div>
+                  <div class="field"><label>Last name</label><input class="input"></div>
+                </div>
+                <div class="form-row">
+                  <div class="field"><label>Phone</label><input class="input" placeholder="+1 555…"></div>
+                  <div class="field"><label>Email</label><input class="input"></div>
+                </div>
+                <div class="field"><label>Notes</label><textarea class="textarea" style="min-height:72px;"></textarea></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="ai-rail">
+            <div class="card" style="border-color:rgba(168,85,247,.35);">
+              <div class="card-title">AI (AITUNNEL)</div>
+              <div class="field"><label>Developer name</label><input class="input" placeholder="для Review notes"></div>
+              <div class="field"><label>Brief / ТЗ</label><textarea class="textarea" style="min-height:72px;" placeholder="Смысл, функции, аудитория…"></textarea></div>
+              <div class="field"><label>Profile</label><select class="select"><option>Human premium ASO</option></select></div>
+              <button class="btn-ai" style="margin-bottom:8px;">Сгенерировать всё</button>
+              <div class="grid-fix">
+                <button class="btn btn-sm">Banned words</button>
+                <button class="btn btn-sm">Shorten</button>
+                <button class="btn btn-sm">Normalize</button>
+                <button class="btn btn-sm">Dashes</button>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-title">Дополнительно</div>
+              <div class="checkbox-row"><span class="cb on"></span> Chain → скриншоты после upload</div>
+              <details style="margin-top:8px;font-size:11px;color:var(--hint);">
+                <summary style="cursor:pointer;color:var(--label);">Custom JSON requests</summary>
+                <textarea class="textarea" style="margin-top:6px;min-height:48px;font-family:monospace;font-size:10px;"></textarea>
+              </details>
+            </div>
+          </div>
+        </div>
+      </div>
+      <aside class="exec-panel">
+        <h3>Статус выполнения</h3>
+        <p class="sub">Прогресс и журнал</p>
+        <div class="progress-meta"><span>0%</span><span>--:--</span></div>
+        <div class="progress"><div class="progress-fill" style="width:0%"></div></div>
+        <div class="log"><div>Готов к загрузке метаданных</div></div>
+      </aside>
+    </div>
+    <div class="sticky-footer"><button class="btn-upload">ЗАГРУЗИТЬ МЕТАДАННЫЕ ПРИЛОЖЕНИЯ</button></div>
+  </div>
+</div>
+<div class="variant-badge">Вариант 1 · AI Rail Pro — компактный toolbar, счётчики символов, 2 колонки внизу</div>
+</div>
+
+<!-- ========== V2: Inner tabs ========== -->
+<div class="screen" id="v2">
+<div class="app">
+  <aside class="sidebar">
+    <div class="logo"><span class="logo-dot"></span> PPO Automation</div>
+    <div class="nav-item active">Метаданные</div>
+    <div class="nav-item">Скриншоты</div>
+    <div class="nav-sep"></div>
+    <div class="nav-item">Настройки API</div>
+  </aside>
+  <div class="main-area">
+    <div class="topbar">
+      <span class="badge badge-ok">Готово</span>
+      <span class="topbar-summary">en-US · 6784998215 · T7-1586</span>
+      <div style="margin-left:auto;display:flex;gap:8px;">
+        <button class="btn btn-sm">Pull</button>
+        <button class="btn btn-primary btn-sm">Jira</button>
+      </div>
+    </div>
+    <div class="content-row">
+      <div class="page">
+        <h1 class="page-title">Метаданные приложения</h1>
+        <p class="page-sub">Разделы на вкладках — меньше скролла, фокус на одной задаче.</p>
+
+        <div class="inner-tabs" id="tabs-v2">
+          <div class="inner-tab active" onclick="switchTab('v2','content',this)">Контент <span class="dot"></span></div>
+          <div class="inner-tab" onclick="switchTab('v2','appinfo',this)">App Info</div>
+          <div class="inner-tab" onclick="switchTab('v2','review',this)">Review</div>
+          <div class="inner-tab" onclick="switchTab('v2','ai',this)">AI генерация</div>
+          <div class="inner-tab" onclick="switchTab('v2','extra',this)">Дополнительно</div>
+        </div>
+
+        <div class="tab-pane active" data-tab="content">
+          <div class="toolbar" style="margin-bottom:12px;">
+            <div class="field" style="max-width:180px;"><label>Локаль</label><select class="select"><option>English (U.S.) en-US</option></select></div>
+            <div class="field" style="max-width:100px;"><label>Версия</label><input class="input" value="1.0.0" readonly></div>
+          </div>
+          <div class="card">
+            <div class="card-title">Version metadata</div>
+            <div class="field"><label>Description <span class="counter">0 / 4000</span></label><textarea class="textarea" style="min-height:140px;"></textarea></div>
+            <div class="grid-2">
+              <div class="field"><label>Keywords <span class="counter">0 / 100</span></label><input class="input"></div>
+              <div class="field"><label>Promotional text</label><textarea class="textarea"></textarea></div>
+            </div>
+            <div class="field"><label>What's New</label><textarea class="textarea"></textarea></div>
+            <div class="form-row">
+              <div class="field"><label>Support URL</label><input class="input"></div>
+              <div class="field"><label>Marketing URL</label><input class="input"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tab-pane" data-tab="appinfo">
+          <div class="card">
+            <div class="card-title">App info</div>
+            <div class="grid-2">
+              <div class="field"><label>Name</label><input class="input"></div>
+              <div class="field"><label>Subtitle</label><input class="input"></div>
+              <div class="field"><label>Copyright</label><input class="input"></div>
+              <div class="field"><label>Age rating</label><input class="input" value="FIVE_AND_UNDER"></div>
+            </div>
+            <div class="form-row">
+              <div class="field"><label>Primary Category</label><select class="select"><option>Utilities</option></select></div>
+              <div class="field"><label>Secondary</label><select class="select"><option>—</option></select></div>
+            </div>
+            <div class="form-row">
+              <div class="field"><label>Privacy Policy</label><input class="input"></div>
+              <div class="field"><label>Privacy Choices</label><input class="input"></div>
+            </div>
+            <div class="checkbox-row"><span class="cb"></span> Собираем данные (App Privacy)</div>
+          </div>
+        </div>
+
+        <div class="tab-pane" data-tab="review">
+          <div class="card">
+            <div class="card-title">App Review notes</div>
+            <div class="grid-2">
+              <div class="field"><label>First name</label><input class="input"></div>
+              <div class="field"><label>Last name</label><input class="input"></div>
+              <div class="field"><label>Phone</label><input class="input"></div>
+              <div class="field"><label>Email</label><input class="input"></div>
+            </div>
+            <div class="field"><label>Notes</label><textarea class="textarea" style="min-height:120px;"></textarea></div>
+          </div>
+        </div>
+
+        <div class="tab-pane" data-tab="ai">
+          <div class="card">
+            <div class="card-title">AI генерация (AITUNNEL)</div>
+            <div class="grid-2">
+              <div class="field"><label>Developer name</label><input class="input"></div>
+              <div class="field"><label>Prompt profile</label><select class="select"><option>Human premium ASO</option></select></div>
+            </div>
+            <div class="field"><label>ТЗ / brief</label><textarea class="textarea" style="min-height:100px;"></textarea></div>
+            <div class="field"><label>Промт</label><textarea class="textarea" style="min-height:140px;font-size:11px;">You are an expert ASO copywriter...</textarea></div>
+            <div style="display:flex;gap:8px;margin-bottom:10px;">
+              <button class="btn btn-sm">Применить профиль</button>
+              <button class="btn btn-sm">Сохранить</button>
+              <button class="btn btn-sm">Стандартный ASO</button>
+            </div>
+            <button class="btn-ai">Сгенерировать всё</button>
+            <div class="grid-fix" style="margin-top:10px;">
+              <button class="btn btn-sm">Fix banned</button>
+              <button class="btn btn-sm">Shorten</button>
+              <button class="btn btn-sm">Normalize</button>
+              <button class="btn btn-sm">Dashes</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="tab-pane" data-tab="extra">
+          <div class="card">
+            <div class="card-title">Дополнительно</div>
+            <div class="checkbox-row"><span class="cb on"></span> После метаданных: TinyPNG → скриншоты</div>
+            <div class="field" style="margin-top:10px;"><label>Custom requests (JSON)</label><textarea class="textarea" style="min-height:100px;font-family:monospace;font-size:11px;"></textarea></div>
+          </div>
+        </div>
+      </div>
+      <aside class="exec-panel">
+        <h3>Статус</h3>
+        <div class="progress"><div class="progress-fill" style="width:0%"></div></div>
+        <div class="log"><div>Ожидание...</div></div>
+      </aside>
+    </div>
+    <div class="sticky-footer"><button class="btn-upload">ЗАГРУЗИТЬ МЕТАДАННЫЕ ПРИЛОЖЕНИЯ</button></div>
+  </div>
+</div>
+<div class="variant-badge">Вариант 2 · Внутренние вкладки — меньше визуального шума, широкая рабочая зона</div>
+</div>
+
+<!-- ========== V3: Accordion ========== -->
+<div class="screen" id="v3">
+<div class="app">
+  <aside class="sidebar">
+    <div class="logo"><span class="logo-dot"></span> PPO Automation</div>
+    <div class="nav-item active">Метаданные</div>
+    <div class="nav-item">Скриншоты</div>
+  </aside>
+  <div class="main-area">
+    <div class="topbar">
+      <span class="badge badge-ok">Готово</span>
+      <span class="topbar-summary">6784998215</span>
+      <button class="btn btn-primary btn-sm" style="margin-left:auto;">Pull · Jira T7-1586</button>
+    </div>
+    <div class="content-row">
+      <div class="page">
+        <h1 class="page-title">Метаданные приложения</h1>
+        <p class="page-sub">Сворачиваемые секции со статусом заполнения. Раскрывайте только нужное.</p>
+
+        <div class="accordion" style="max-width:900px;">
+          <div class="acc-item open">
+            <div class="acc-header" onclick="toggleAcc(this)">
+              <div><div class="title">Источник и локаль</div><div class="meta">en-US · версия 1.0.0</div></div>
+              <div style="display:flex;align-items:center;gap:10px;">
+                <span class="status-pill done">Готово</span><span class="chev">▼</span>
+              </div>
+            </div>
+            <div class="acc-body">
+              <div class="form-row">
+                <div class="field"><label>Локаль</label><select class="select"><option>English (U.S.) en-US</option></select></div>
+                <div class="field"><label>Версия</label><input class="input" value="1.0.0" readonly></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="acc-item open">
+            <div class="acc-header" onclick="toggleAcc(this)">
+              <div><div class="title">Version metadata</div><div class="meta">Description, Keywords, URLs</div></div>
+              <div style="display:flex;align-items:center;gap:10px;">
+                <span class="status-pill partial">2 / 6</span><span class="chev">▼</span>
+              </div>
+            </div>
+            <div class="acc-body">
+              <div class="field"><label>Description <span class="counter">0 / 4000</span></label><textarea class="textarea" style="min-height:100px;"></textarea></div>
+              <div class="grid-2">
+                <div class="field"><label>Keywords</label><input class="input"></div>
+                <div class="field"><label>Promotional text</label><textarea class="textarea"></textarea></div>
+              </div>
+              <div class="field"><label>What's New</label><textarea class="textarea"></textarea></div>
+              <div class="form-row">
+                <div class="field"><label>Support URL</label><input class="input"></div>
+                <div class="field"><label>Marketing URL</label><input class="input"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="acc-item">
+            <div class="acc-header" onclick="toggleAcc(this)">
+              <div><div class="title">App info</div><div class="meta">Name, categories, privacy</div></div>
+              <div style="display:flex;align-items:center;gap:10px;">
+                <span class="status-pill empty">Пусто</span><span class="chev">▼</span>
+              </div>
+            </div>
+            <div class="acc-body">
+              <div class="grid-2">
+                <div class="field"><label>Name</label><input class="input"></div>
+                <div class="field"><label>Subtitle</label><input class="input"></div>
+              </div>
+              <div class="form-row">
+                <div class="field"><label>Primary</label><select class="select"><option>Utilities</option></select></div>
+                <div class="field"><label>Secondary</label><select class="select"><option>—</option></select></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="acc-item">
+            <div class="acc-header" onclick="toggleAcc(this)">
+              <div><div class="title">App Review notes</div><div class="meta">Контакты для ревьюера</div></div>
+              <div style="display:flex;align-items:center;gap:10px;">
+                <span class="status-pill empty">Пусто</span><span class="chev">▼</span>
+              </div>
+            </div>
+            <div class="acc-body">
+              <div class="grid-2">
+                <div class="field"><label>First / Last</label><input class="input" placeholder="Имя Фамилия"></div>
+                <div class="field"><label>Phone / Email</label><input class="input"></div>
+              </div>
+              <div class="field"><label>Notes</label><textarea class="textarea"></textarea></div>
+            </div>
+          </div>
+
+          <div class="acc-item">
+            <div class="acc-header" onclick="toggleAcc(this)">
+              <div><div class="title">AI генерация</div><div class="meta">AITUNNEL · Human premium ASO</div></div>
+              <div style="display:flex;align-items:center;gap:10px;">
+                <span class="status-pill partial">Brief есть</span><span class="chev">▼</span>
+              </div>
+            </div>
+            <div class="acc-body">
+              <div class="field"><label>Brief</label><textarea class="textarea" style="min-height:80px;"></textarea></div>
+              <button class="btn-ai">Сгенерировать всё</button>
+              <div class="grid-fix" style="margin-top:8px;">
+                <button class="btn btn-sm">Fix banned</button>
+                <button class="btn btn-sm">Shorten</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <aside class="exec-panel">
+        <h3>Статус</h3>
+        <div class="log"><div>Ожидание...</div></div>
+      </aside>
+    </div>
+    <div class="sticky-footer"><button class="btn-upload">ЗАГРУЗИТЬ МЕТАДАННЫЕ ПРИЛОЖЕНИЯ</button></div>
+  </div>
+</div>
+<div class="variant-badge">Вариант 3 · Аккордеон — прогресс заполнения, компактный список секций</div>
+</div>
+
+<!-- ========== V4: Stepper wizard ========== -->
+<div class="screen" id="v4">
+<div class="app">
+  <aside class="sidebar">
+    <div class="logo"><span class="logo-dot"></span> PPO Automation</div>
+    <div class="nav-item active">Метаданные</div>
+  </aside>
+  <div class="main-area">
+    <div class="topbar">
+      <span class="badge badge-ok">Готово</span>
+      <span class="topbar-summary">Шаг 2 из 5 · Version metadata</span>
+    </div>
+    <div class="content-row">
+      <div class="page" style="max-width:820px;margin:0 auto;">
+        <h1 class="page-title">Метаданные приложения</h1>
+        <p class="page-sub">Пошаговый мастер — удобно для новых релизов и обучения.</p>
+
+        <div class="stepper" id="stepper-v4">
+          <div class="step done" onclick="goStep(0)"><div class="step-num">1</div>Источник</div>
+          <div class="step active" onclick="goStep(1)"><div class="step-num">2</div>Контент</div>
+          <div class="step" onclick="goStep(2)"><div class="step-num">3</div>App Info</div>
+          <div class="step" onclick="goStep(3)"><div class="step-num">4</div>Review</div>
+          <div class="step" onclick="goStep(4)"><div class="step-num">5</div>AI & Upload</div>
+        </div>
+
+        <div class="step-pane" data-step="0">
+          <div class="card">
+            <div class="card-title">Шаг 1 — Источник данных</div>
+            <div class="form-row">
+              <div class="field"><label>Локаль</label><select class="select"><option>en-US</option></select></div>
+              <div class="field"><label>Версия</label><input class="input" readonly></div>
+            </div>
+            <button class="btn btn-sm" style="margin-top:8px;">Pull from Apple</button>
+          </div>
+        </div>
+        <div class="step-pane active" data-step="1">
+          <div class="card">
+            <div class="card-title">Шаг 2 — Version metadata</div>
+            <div class="field"><label>Description</label><textarea class="textarea" style="min-height:130px;"></textarea></div>
+            <div class="field"><label>Keywords</label><input class="input"></div>
+            <div class="field"><label>What's New</label><textarea class="textarea"></textarea></div>
+          </div>
+        </div>
+        <div class="step-pane" data-step="2">
+          <div class="card">
+            <div class="card-title">Шаг 3 — App info</div>
+            <div class="field"><label>Name</label><input class="input"></div>
+            <div class="field"><label>Subtitle</label><input class="input"></div>
+          </div>
+        </div>
+        <div class="step-pane" data-step="3">
+          <div class="card">
+            <div class="card-title">Шаг 4 — Review notes</div>
+            <div class="field"><label>Notes</label><textarea class="textarea" style="min-height:100px;"></textarea></div>
+          </div>
+        </div>
+        <div class="step-pane" data-step="4">
+          <div class="card">
+            <div class="card-title">Шаг 5 — AI и финал</div>
+            <div class="field"><label>Brief</label><textarea class="textarea"></textarea></div>
+            <button class="btn-ai">Сгенерировать перед upload</button>
+          </div>
+        </div>
+
+        <div class="step-nav">
+          <button class="btn" onclick="goStep(Math.max(0, currentStep-1))">Назад</button>
+          <button class="btn btn-primary" onclick="goStep(Math.min(4, currentStep+1))">Далее</button>
+        </div>
+      </div>
+      <aside class="exec-panel">
+        <h3>Статус</h3>
+        <div class="log"><div class="ok">Шаг 1 завершён</div></div>
+      </aside>
+    </div>
+    <div class="sticky-footer"><button class="btn-upload">ЗАГРУЗИТЬ МЕТАДАННЫЕ ПРИЛОЖЕНИЯ</button></div>
+  </div>
+</div>
+<div class="variant-badge">Вариант 4 · Мастер-шаги — для сложных форм и онбординга</div>
+</div>
+
+<!-- ========== V5: Editor + field nav ========== -->
+<div class="screen" id="v5">
+<div class="app">
+  <aside class="sidebar">
+    <div class="logo"><span class="logo-dot"></span> PPO Automation</div>
+    <div class="nav-item active">Метаданные</div>
+  </aside>
+  <div class="main-area">
+    <div class="topbar">
+      <span class="badge badge-ok">Готово</span>
+      <span class="topbar-summary">en-US · T7-1586</span>
+      <button class="btn btn-sm" style="margin-left:8px;">Pull</button>
+    </div>
+    <div class="content-row">
+      <div class="page">
+        <h1 class="page-title">Метаданные приложения</h1>
+        <p class="page-sub">Навигация по полям слева, редактор по центру, AI справа — как в IDE.</p>
+
+        <div class="editor-layout">
+          <nav class="field-nav">
+            <div class="nav-title">Поля</div>
+            <a class="active" onclick="focusField(this,'desc')">Description</a>
+            <a onclick="focusField(this,'kw')">Keywords</a>
+            <a onclick="focusField(this,'promo')">Promotional text</a>
+            <a onclick="focusField(this,'whatsnew')">What's New</a>
+            <a onclick="focusField(this,'support')">Support URL</a>
+            <div class="section">
+              <div class="nav-title">App info</div>
+              <a onclick="focusField(this,'name')">Name</a>
+              <a onclick="focusField(this,'subtitle')">Subtitle</a>
+              <a onclick="focusField(this,'category')">Categories</a>
+            </div>
+            <div class="section">
+              <div class="nav-title">Review</div>
+              <a onclick="focusField(this,'notes')">Notes</a>
+            </div>
+          </nav>
+
+          <div class="editor-main">
+            <div class="card" style="margin-bottom:0;">
+              <div class="field focused" id="fld-desc">
+                <label>Description <span class="counter">0 / 4000</span></label>
+                <textarea class="textarea" style="min-height:160px;" placeholder="Главное поле — начните здесь"></textarea>
+                <p class="mini-stat">App Store Connect · локаль en-US</p>
+              </div>
+              <div class="field" id="fld-kw" style="margin-top:14px;">
+                <label>Keywords <span class="counter">0 / 100</span></label>
+                <input class="input">
+              </div>
+              <div class="field" id="fld-promo" style="margin-top:14px;">
+                <label>Promotional text</label>
+                <textarea class="textarea"></textarea>
+              </div>
+              <div class="field" id="fld-whatsnew" style="margin-top:14px;">
+                <label>What's New</label>
+                <textarea class="textarea"></textarea>
+              </div>
+              <div class="field" id="fld-support" style="margin-top:14px;">
+                <label>Support URL</label>
+                <input class="input">
+              </div>
+            </div>
+          </div>
+
+          <div class="ai-rail">
+            <div class="card">
+              <div class="card-title">AI для поля</div>
+              <p style="font-size:11px;color:var(--hint);margin-bottom:10px;">Генерация и правки для активного поля</p>
+              <div class="field"><label>Brief</label><textarea class="textarea" style="min-height:64px;"></textarea></div>
+              <button class="btn-ai" style="margin-bottom:6px;">Сгенерировать поле</button>
+              <button class="btn" style="width:100%;">Сгенерировать всё</button>
+              <div class="grid-fix" style="margin-top:8px;">
+                <button class="btn btn-sm">Shorten</button>
+                <button class="btn btn-sm">Banned</button>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-title">Jira</div>
+              <div class="field"><label>Issue</label><input class="input" value="T7-1586"></div>
+              <button class="btn btn-primary btn-sm" style="width:100%;">Обновить карточку</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <aside class="exec-panel">
+        <h3>Статус</h3>
+        <div class="log"><div>Редактирование: Description</div></div>
+      </aside>
+    </div>
+    <div class="sticky-footer"><button class="btn-upload">ЗАГРУЗИТЬ МЕТАДАННЫЕ ПРИЛОЖЕНИЯ</button></div>
+  </div>
+</div>
+<div class="variant-badge">Вариант 5 · Редактор + навигация — быстрый переход между полями</div>
+</div>
+
+<script>
+let currentStep = 1;
+
+function show(id, btn) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.switcher button').forEach(b => b.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
+}
+
+function switchTab(screenId, tab, el) {
+  const screen = document.getElementById(screenId);
+  screen.querySelectorAll('.inner-tab').forEach(t => t.classList.remove('active'));
+  screen.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  el.classList.add('active');
+  screen.querySelector('.tab-pane[data-tab="' + tab + '"]').classList.add('active');
+}
+
+function toggleAcc(header) {
+  header.parentElement.classList.toggle('open');
+}
+
+function goStep(n) {
+  currentStep = n;
+  const screen = document.getElementById('v4');
+  screen.querySelectorAll('.step').forEach((s, i) => {
+    s.classList.remove('active', 'done');
+    if (i < n) s.classList.add('done');
+    if (i === n) s.classList.add('active');
+  });
+  screen.querySelectorAll('.step-pane').forEach(p => p.classList.remove('active'));
+  const pane = screen.querySelector('.step-pane[data-step="' + n + '"]');
+  if (pane) pane.classList.add('active');
+}
+
+function focusField(link, id) {
+  document.querySelectorAll('.field-nav a').forEach(a => a.classList.remove('active'));
+  link.classList.add('active');
+  document.querySelectorAll('.editor-main .field').forEach(f => f.classList.remove('focused'));
+  const fld = document.getElementById('fld-' + id);
+  if (fld) { fld.classList.add('focused'); fld.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+}
+</script>
+</body>
+</html>
