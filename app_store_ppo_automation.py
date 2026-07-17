@@ -19,12 +19,6 @@ from PIL import Image, ImageOps
 from dotenv import load_dotenv
 import yaml
 from image_optimize import LocalImageOptimizer
-from xcode_ipa_build import (
-    build_and_optionally_upload,
-    discover_scheme,
-    find_xcode_project_dir_by_app_name,
-    find_xcodeproj,
-)
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QLineEdit, QPushButton, QTextEdit, QFileDialog, QLabel, QGroupBox,
@@ -60,6 +54,7 @@ STOREPAL_DASHBOARD_NEW_APP_URL = f"{STOREPAL_BASE_URL}/dashboard/apps/new"
 STOREPAL_DOCS_CLI_URL = f"{STOREPAL_BASE_URL}/docs/cli"
 FIGMA_API_BASE = "https://api.figma.com"
 ACCOUNTS_ROSTER_PATH = os.path.join(SCRIPT_DIR, ".accounts_roster.json")
+GITLAB_PROJECT_MAP_PATH = os.path.join(SCRIPT_DIR, ".gitlab_project_map.json")
 FORMSPREE_FORM_BASE = "https://formspree.io/f"
 WEB3FORMS_SUBMIT_URL = "https://api.web3forms.com/submit"
 CATBOX_UPLOAD_URL = "https://catbox.moe/user/api.php"
@@ -68,8 +63,6 @@ ZERODEPLOY_DROP_URL = "https://api.zerodeploy.dev/drop"
 LITTERBOX_UPLOAD_URL = "https://litterbox.catbox.moe/resources/internals/api.php"
 GITLAB_APPLE_CONNECT_PATH = ".metadata/apple-connect.yaml"
 GITLAB_DEFAULT_REF = "main"
-DEFAULT_XCODE_PROJECTS_ROOT = os.path.expanduser("~/Downloads/Projects")
-DEFAULT_XCODE_PROJECT_PATH = ""  # подставляется по имени после «Загрузить App ID»
 
 AITUNNEL_API_BASE = os.getenv("AITUNNEL_API_BASE", "https://api.aitunnel.ru/v1").rstrip("/")
 AITUNNEL_MODELS_URL = "https://api.aitunnel.ru/public/aitunnel/models/chat"
@@ -629,41 +622,6 @@ def resolve_gitlab_token():
     )
 
 
-def resolve_xcode_projects_root():
-    env_file = _read_env_file()
-    return (
-        env_file.get("XCODE_PROJECTS_ROOT", "").strip()
-        or os.getenv("XCODE_PROJECTS_ROOT", "").strip()
-        or DEFAULT_XCODE_PROJECTS_ROOT
-    )
-
-
-def resolve_xcode_project_path():
-    env_file = _read_env_file()
-    return (
-        env_file.get("XCODE_PROJECT_PATH", "").strip()
-        or os.getenv("XCODE_PROJECT_PATH", "").strip()
-        or DEFAULT_XCODE_PROJECT_PATH
-    )
-
-
-def resolve_xcode_scheme():
-    env_file = _read_env_file()
-    return (
-        env_file.get("XCODE_SCHEME", "").strip()
-        or os.getenv("XCODE_SCHEME", "").strip()
-    )
-
-
-def resolve_xcode_team_id():
-    env_file = _read_env_file()
-    return (
-        env_file.get("XCODE_TEAM_ID", "").strip()
-        or os.getenv("XCODE_TEAM_ID", "").strip()
-        or os.getenv("DEVELOPMENT_TEAM", "").strip()
-    )
-
-
 def normalize_app_name_for_gitlab(app_name):
     """River Aspect → RiverAspect (для матча path/name репо)."""
     return re.sub(r"[^a-zA-Z0-9]+", "", (app_name or "").strip())
@@ -742,6 +700,34 @@ def extract_apple_connect_brief(yaml_text):
     return ""
 
 
+def normalize_gitlab_project_ref(value, base_url=None):
+    """Принимает path, id или полный URL → (project_path_or_id, base_url_or_None).
+
+    Пример:
+    https://cicd.datamin.app/auto_ci_cd/RescueGridAtlas-20260717-glb4pl3f
+    → ('auto_ci_cd/RescueGridAtlas-20260717-glb4pl3f', 'https://cicd.datamin.app')
+    """
+    value = (value or "").strip()
+    if not value:
+        return "", None
+
+    if re.match(r"^https?://", value, re.I):
+        parsed = urlparse(value)
+        host_base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+        path = (parsed.path or "").strip()
+        path = re.split(r"/-/", path, maxsplit=1)[0]
+        path = path.strip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        # убрать ведущие сегменты вроде users/sign_in — оставляем как есть
+        return path, host_base or None
+
+    value = value.strip().strip("/")
+    if value.endswith(".git"):
+        value = value[:-4]
+    return value, None
+
+
 def gitlab_search_projects(search, token=None, base_url=None, per_page=50):
     token = (token or resolve_gitlab_token()).strip()
     base = (base_url or resolve_gitlab_base_url()).rstrip("/")
@@ -767,12 +753,93 @@ def gitlab_search_projects(search, token=None, base_url=None, per_page=50):
     return data if isinstance(data, list) else []
 
 
-def gitlab_pick_best_project(projects, app_name):
+def gitlab_get_project(project_ref, token=None, base_url=None):
+    """project_ref: numeric id, path group/repo, или полный URL репо."""
+    token = (token or resolve_gitlab_token()).strip()
+    project_ref, url_base = normalize_gitlab_project_ref(project_ref, base_url)
+    base = (url_base or base_url or resolve_gitlab_base_url()).rstrip("/")
+    if not token:
+        raise RuntimeError("Нет GITLAB_TOKEN.")
+    if not project_ref:
+        raise RuntimeError("Пустой GitLab project.")
+    encoded = quote(project_ref, safe="")
+    response = requests.get(
+        f"{base}/api/v4/projects/{encoded}",
+        headers={"PRIVATE-TOKEN": token, "Accept": "application/json"},
+        timeout=45,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"GitLab project «{project_ref}» не найден ({response.status_code}): {response.text[:300]}"
+        )
+    data = response.json()
+    if not isinstance(data, dict) or not data.get("id"):
+        raise RuntimeError(f"GitLab: неожиданный ответ для проекта «{project_ref}».")
+    return data
+
+
+def load_gitlab_project_map():
+    if not os.path.isfile(GITLAB_PROJECT_MAP_PATH):
+        return {}
+    try:
+        with open(GITLAB_PROJECT_MAP_PATH, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+
+
+def save_gitlab_project_map(mapping):
+    try:
+        with open(GITLAB_PROJECT_MAP_PATH, "w", encoding="utf-8") as handle:
+            json.dump(mapping or {}, handle, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def lookup_gitlab_project_ref(app_id="", app_name=""):
+    """Достаёт сохранённый path/id репо для App ID или имени App Store."""
+    mapping = load_gitlab_project_map()
+    app_id = (app_id or "").strip()
+    app_name = (app_name or "").strip()
+    by_id = mapping.get("by_app_id") if isinstance(mapping.get("by_app_id"), dict) else {}
+    by_name = mapping.get("by_app_name") if isinstance(mapping.get("by_app_name"), dict) else {}
+    if app_id and by_id.get(app_id):
+        return str(by_id[app_id]).strip()
+    name_key = normalize_app_name_for_gitlab(app_name).lower()
+    if name_key:
+        for key, value in by_name.items():
+            if normalize_app_name_for_gitlab(key).lower() == name_key and value:
+                return str(value).strip()
+    return ""
+
+
+def remember_gitlab_project_ref(project_ref, app_id="", app_name=""):
+    project_ref, _url_base = normalize_gitlab_project_ref(project_ref)
+    if not project_ref:
+        return
+    mapping = load_gitlab_project_map()
+    by_id = mapping.get("by_app_id") if isinstance(mapping.get("by_app_id"), dict) else {}
+    by_name = mapping.get("by_app_name") if isinstance(mapping.get("by_app_name"), dict) else {}
+    app_id = (app_id or "").strip()
+    app_name = (app_name or "").strip()
+    if app_id:
+        by_id[app_id] = project_ref
+    if app_name:
+        by_name[app_name] = project_ref
+    mapping["by_app_id"] = by_id
+    mapping["by_app_name"] = by_name
+    save_gitlab_project_map(mapping)
+
+
+def gitlab_pick_best_project(projects, app_name, min_score=70):
+    """Возвращает проект только при уверенном совпадении имени — иначе None.
+
+    Раньше при score=0 брался projects[0] (чужой/старый репо) — это и давало баг.
+    """
     compact = normalize_app_name_for_gitlab(app_name).lower()
-    if not projects:
+    if not projects or not compact:
         return None
-    if not compact:
-        return projects[0]
 
     best = None
     best_score = -1
@@ -794,7 +861,9 @@ def gitlab_pick_best_project(projects, app_name):
         if score > best_score:
             best_score = score
             best = project
-    return best if best_score > 0 else projects[0]
+    if best_score < min_score:
+        return None
+    return best
 
 
 def gitlab_fetch_file_raw(
@@ -831,35 +900,10 @@ def gitlab_fetch_file_raw(
     raise RuntimeError(f"Файл {file_path} не найден в проекте {project_id}. {last_error or ''}")
 
 
-def fetch_gitlab_app_brief(app_name, token=None, base_url=None):
-    """Ищет репо по имени приложения и достаёт description.value из apple-connect.yaml."""
-    app_name = (app_name or "").strip()
-    if not app_name:
-        raise RuntimeError("Нет названия приложения для поиска в GitLab.")
+def fetch_gitlab_brief_from_project(project, app_name="", token=None, base_url=None):
+    """Читает apple-connect.yaml из уже найденного GitLab project dict."""
     token = (token or resolve_gitlab_token()).strip()
     base = (base_url or resolve_gitlab_base_url()).rstrip("/")
-    compact = normalize_app_name_for_gitlab(app_name)
-    queries = []
-    for q in (compact, app_name, app_name.replace(" ", "")):
-        q = (q or "").strip()
-        if q and q not in queries:
-            queries.append(q)
-
-    projects = []
-    seen_ids = set()
-    for query in queries:
-        for item in gitlab_search_projects(query, token=token, base_url=base):
-            pid = item.get("id")
-            if pid in seen_ids:
-                continue
-            seen_ids.add(pid)
-            projects.append(item)
-        if projects:
-            break
-    if not projects:
-        raise RuntimeError(f"GitLab: проект для «{app_name}» не найден (искал: {', '.join(queries)}).")
-
-    project = gitlab_pick_best_project(projects, app_name)
     project_id = project.get("id")
     project_path = project.get("path_with_namespace") or project.get("path") or str(project_id)
     default_branch = (project.get("default_branch") or "").strip() or GITLAB_DEFAULT_REF
@@ -907,6 +951,80 @@ def fetch_gitlab_app_brief(app_name, token=None, base_url=None):
     raise RuntimeError(
         f"GitLab: в {project_path}/{GITLAB_APPLE_CONNECT_PATH} "
         f"(ref={last_ref}) не найден непустой description.value.{snippet}"
+    )
+
+
+def fetch_gitlab_app_brief(app_name, token=None, base_url=None, project_ref=""):
+    """Достаёт ТЗ из GitLab.
+
+    project_ref: path group/repo, id, или полный URL репо.
+    Если пусто — поиск по имени App Store (только при уверенном совпадении).
+    """
+    app_name = (app_name or "").strip()
+    token = (token or resolve_gitlab_token()).strip()
+    base = (base_url or resolve_gitlab_base_url()).rstrip("/")
+
+    project_ref, url_base = normalize_gitlab_project_ref(project_ref, base)
+    if url_base:
+        base = url_base
+
+    if project_ref:
+        project = gitlab_get_project(project_ref, token=token, base_url=base)
+        return fetch_gitlab_brief_from_project(
+            project,
+            app_name=app_name or project_ref,
+            token=token,
+            base_url=base,
+        )
+
+    if not app_name:
+        raise RuntimeError(
+            "Нет названия приложения и нет GitLab репо. "
+            "Вставьте ссылку на репо, например:\n"
+            "https://cicd.datamin.app/auto_ci_cd/MyRepo-…"
+        )
+
+    compact = normalize_app_name_for_gitlab(app_name)
+    queries = []
+    for q in (compact, app_name, app_name.replace(" ", "")):
+        q = (q or "").strip()
+        if q and q not in queries:
+            queries.append(q)
+
+    projects = []
+    seen_ids = set()
+    for query in queries:
+        for item in gitlab_search_projects(query, token=token, base_url=base):
+            pid = item.get("id")
+            if pid in seen_ids:
+                continue
+            seen_ids.add(pid)
+            projects.append(item)
+        if projects:
+            break
+    if not projects:
+        raise RuntimeError(
+            f"GitLab: проект для «{app_name}» не найден (искал: {', '.join(queries)}).\n"
+            f"Вставьте ссылку на репо в поле «GitLab репо», например:\n"
+            f"https://cicd.datamin.app/auto_ci_cd/RescueGridAtlas-…"
+        )
+
+    project = gitlab_pick_best_project(projects, app_name)
+    if not project:
+        sample = ", ".join(
+            (p.get("path_with_namespace") or p.get("path") or "?")
+            for p in projects[:5]
+        )
+        raise RuntimeError(
+            f"GitLab: имя App Store «{app_name}» не совпало ни с одним репо "
+            f"(найдено: {sample}).\n"
+            f"Вставьте ссылку на нужный репо в поле «GitLab репо»."
+        )
+    return fetch_gitlab_brief_from_project(
+        project,
+        app_name=app_name,
+        token=token,
+        base_url=base,
     )
 
 
@@ -5086,19 +5204,27 @@ class GitLabBriefWorker(QThread):
     brief_failed = Signal(str)
     finished = Signal()
 
-    def __init__(self, app_name, token="", base_url=""):
+    def __init__(self, app_name, token="", base_url="", project_ref=""):
         super().__init__()
         self.app_name = app_name
         self.token = token
         self.base_url = base_url
+        self.project_ref = project_ref
 
     def run(self):
         try:
-            self.log_msg.emit(f"GitLab: ищу ТЗ для «{self.app_name}»...")
+            if self.project_ref:
+                self.log_msg.emit(
+                    f"GitLab: ТЗ из репо «{self.project_ref}» "
+                    f"(App Store: «{self.app_name or '—'}»)..."
+                )
+            else:
+                self.log_msg.emit(f"GitLab: ищу ТЗ для «{self.app_name}»...")
             result = fetch_gitlab_app_brief(
                 self.app_name,
                 token=self.token,
                 base_url=self.base_url,
+                project_ref=self.project_ref,
             )
             self.log_msg.emit(
                 f"GitLab: ТЗ из {result.get('project_path')}/{GITLAB_APPLE_CONNECT_PATH} "
@@ -5107,51 +5233,6 @@ class GitLabBriefWorker(QThread):
             self.brief_ready.emit(result)
         except Exception as e:
             self.brief_failed.emit(str(e))
-        finally:
-            self.finished.emit()
-
-
-class XcodeIpaWorker(QThread):
-    """Локальный аналог Codemagic: archive → IPA → (опционально) upload."""
-    log_msg = Signal(str)
-    build_ok = Signal(dict)
-    build_failed = Signal(str)
-    finished = Signal()
-
-    def __init__(self, options):
-        super().__init__()
-        self.options = options or {}
-
-    def run(self):
-        try:
-            opts = self.options
-            asc_client = None
-            if opts.get("bump_build") or opts.get("need_asc"):
-                asc_client = ASCClient(
-                    opts["issuer_id"],
-                    opts["key_id"],
-                    opts["private_key_path"],
-                    opts["app_id"],
-                    lambda msg: self.log_msg.emit(msg),
-                )
-            result = build_and_optionally_upload(
-                project_dir=opts.get("project_dir", ""),
-                scheme=opts.get("scheme", ""),
-                team_id=opts.get("team_id", ""),
-                apple_id=opts.get("app_id", ""),
-                issuer_id=opts.get("issuer_id", ""),
-                key_id=opts.get("key_id", ""),
-                private_key_path=opts.get("private_key_path", ""),
-                bump_build=bool(opts.get("bump_build")),
-                upload=bool(opts.get("upload")),
-                scan_leaks=bool(opts.get("scan_leaks")),
-                run_bulder=bool(opts.get("run_bulder")),
-                asc_client=asc_client,
-                log=lambda msg: self.log_msg.emit(msg),
-            )
-            self.build_ok.emit(result)
-        except Exception as e:
-            self.build_failed.emit(str(e))
         finally:
             self.finished.emit()
 
@@ -7193,11 +7274,21 @@ class MainWindow(QWidget):
         self.ai_prompt_input.setPlainText(self.ai_prompt_profiles.get("Human premium ASO", DEFAULT_GEMINI_PROMPT))
         self._add_metadata_stacked_field(ai_tab_layout, "Developer name", self.ai_developer_name_input)
         self._add_metadata_stacked_field(ai_tab_layout, "ТЗ / brief приложения", self.ai_app_context_input)
+        self.gitlab_project_input = QLineEdit()
+        self.gitlab_project_input.setPlaceholderText(
+            "Ссылка или path GitLab, если имя другое: https://cicd.datamin.app/group/repo"
+        )
+        self.gitlab_project_input.setToolTip(
+            "Когда репо называется не как App Store — вставьте полную ссылку или group/repo. "
+            "Пусто = только уверенный автопоиск по Name (без чужих репо)."
+        )
+        self._add_metadata_stacked_field(ai_tab_layout, "GitLab репо / ссылка", self.gitlab_project_input)
         gitlab_brief_row = QHBoxLayout()
         self.btn_fetch_gitlab_brief = QPushButton("📥 ТЗ из GitLab")
         self.btn_fetch_gitlab_brief.setObjectName("utility_btn")
         self.btn_fetch_gitlab_brief.setToolTip(
-            f"Найти репо по Name и подставить description.value из {GITLAB_APPLE_CONNECT_PATH}"
+            f"Сначала path из поля GitLab репо / сохранённая связка, иначе поиск по Name. "
+            f"Файл: {GITLAB_APPLE_CONNECT_PATH}"
         )
         self.btn_fetch_gitlab_brief.clicked.connect(
             lambda: self._fetch_gitlab_brief(force=True, only_if_empty=False)
@@ -7692,108 +7783,6 @@ class MainWindow(QWidget):
         self.feedback_table.setEditTriggers(QTableWidget.NoEditTriggers)
         feedback_layout.addWidget(self.feedback_table, stretch=1)
         self.tabs.addTab(self.tab_feedback, "Feedback", "💬")
-
-        self.tab_build = QWidget()
-        build_outer = QVBoxLayout(self.tab_build)
-        build_outer.setContentsMargins(0, 0, 0, 0)
-        build_outer.setSpacing(0)
-        build_scroll = QScrollArea()
-        build_scroll.setWidgetResizable(True)
-        build_scroll.setFrameShape(QFrame.NoFrame)
-        build_inner = QWidget()
-        build_layout = QVBoxLayout(build_inner)
-        build_layout.setSpacing(12)
-        build_layout.setContentsMargins(4, 4, 12, 12)
-        build_scroll.setWidget(build_inner)
-        build_outer.addWidget(build_scroll)
-        build_layout.addWidget(make_page_header(
-            "Билд IPA (вместо Codemagic)",
-            "На этом Mac: Pushwoosh-скрипт → +1 build → Archive → IPA → заливка в App Store Connect. "
-            "После «Загрузить App ID» папка проекта подставляется автоматически по имени из "
-            "корня Projects (как GitLab)."
-        ))
-        if sys.platform != "darwin":
-            mac_only = QLabel("⚠ Сборка IPA работает только на macOS с установленным Xcode.")
-            mac_only.setProperty("role", "hint")
-            mac_only.setWordWrap(True)
-            build_layout.addWidget(mac_only)
-
-        self.xcode_projects_root_input = QLineEdit(resolve_xcode_projects_root())
-        self.xcode_projects_root_input.setPlaceholderText("Корень папок проектов, напр. ~/Downloads/Projects")
-        self.xcode_projects_root_input.editingFinished.connect(self._save_env_to_file)
-        self.btn_pick_xcode_projects_root = QPushButton("Корень…")
-        self.btn_pick_xcode_projects_root.setObjectName("utility_btn")
-        self.btn_pick_xcode_projects_root.setMinimumWidth(100)
-        self.btn_pick_xcode_projects_root.clicked.connect(self._pick_xcode_projects_root)
-        _add_labeled_fields_row(
-            build_layout,
-            [("Корень Projects", self.xcode_projects_root_input)],
-            trailing_widget=self.btn_pick_xcode_projects_root,
-        )
-
-        self.xcode_project_input = QLineEdit(resolve_xcode_project_path())
-        self.xcode_project_input.setPlaceholderText("Папка Xcode-проекта (где .xcodeproj) — авто после App ID")
-        self.xcode_project_input.editingFinished.connect(self._save_env_to_file)
-        self.btn_pick_xcode_project = QPushButton("Выбрать папку")
-        self.btn_pick_xcode_project.setObjectName("utility_btn")
-        self.btn_pick_xcode_project.setMinimumWidth(140)
-        self.btn_pick_xcode_project.clicked.connect(self._pick_xcode_project_dir)
-        _add_labeled_fields_row(
-            build_layout,
-            [("Xcode проект", self.xcode_project_input)],
-            trailing_widget=self.btn_pick_xcode_project,
-        )
-
-        self.xcode_scheme_input = QLineEdit(resolve_xcode_scheme())
-        self.xcode_scheme_input.setPlaceholderText("Scheme (пусто = авто)")
-        self.xcode_scheme_input.editingFinished.connect(self._save_env_to_file)
-        self.xcode_team_input = QLineEdit(resolve_xcode_team_id())
-        self.xcode_team_input.setPlaceholderText("Team ID (пусто = из Bulder-скрипта / Xcode)")
-        self.xcode_team_input.editingFinished.connect(self._save_env_to_file)
-        _add_labeled_fields_row(
-            build_layout,
-            [("Scheme", self.xcode_scheme_input), ("Team ID", self.xcode_team_input)],
-        )
-
-        self.xcode_run_bulder_checkbox = QCheckBox(
-            "Запустить Scripts/bulder_pushwoosh_build_config.py (как в Codemagic)"
-        )
-        self.xcode_run_bulder_checkbox.setChecked(True)
-        self.xcode_bump_build_checkbox = QCheckBox("+1 к build number из App Store Connect (agvtool)")
-        self.xcode_bump_build_checkbox.setChecked(True)
-        self.xcode_scan_leaks_checkbox = QCheckBox(
-            "Проверить утечки перед сборкой (IP, /Users/…, MAC) — только лог, не удаляет"
-        )
-        self.xcode_scan_leaks_checkbox.setChecked(True)
-        build_layout.addWidget(self.xcode_run_bulder_checkbox)
-        build_layout.addWidget(self.xcode_bump_build_checkbox)
-        build_layout.addWidget(self.xcode_scan_leaks_checkbox)
-
-        build_btns = QHBoxLayout()
-        self.btn_xcode_detect = QPushButton("Определить scheme")
-        self.btn_xcode_detect.setObjectName("utility_btn")
-        self.btn_xcode_detect.clicked.connect(self._detect_xcode_scheme)
-        self.btn_xcode_build_only = QPushButton("Собрать IPA")
-        self.btn_xcode_build_only.setObjectName("utility_btn")
-        self.btn_xcode_build_only.setMinimumHeight(44)
-        self.btn_xcode_build_only.clicked.connect(lambda: self._start_xcode_ipa_build(upload=False))
-        self.btn_xcode_build_upload = QPushButton("🚀 Собрать и залить в App Store")
-        self.btn_xcode_build_upload.setObjectName("main_generate_btn")
-        self.btn_xcode_build_upload.setMinimumHeight(50)
-        self.btn_xcode_build_upload.clicked.connect(lambda: self._start_xcode_ipa_build(upload=True))
-        build_btns.addWidget(self.btn_xcode_detect)
-        build_btns.addWidget(self.btn_xcode_build_only, 1)
-        build_btns.addWidget(self.btn_xcode_build_upload, 2)
-        build_layout.addLayout(build_btns)
-
-        self.xcode_build_status = QLabel(
-            "IPA сохранится в <проект>/build/ppo_ipa/. Подпись — automatic (нужен вход в Xcode → Accounts)."
-        )
-        self.xcode_build_status.setProperty("role", "hint")
-        self.xcode_build_status.setWordWrap(True)
-        build_layout.addWidget(self.xcode_build_status)
-        build_layout.addStretch(1)
-        self.tabs.addTab(self.tab_build, "Билд IPA", "📦")
 
         self.tab_accounts = QWidget()
         accounts_layout = QVBoxLayout(self.tab_accounts)
@@ -9149,11 +9138,8 @@ class MainWindow(QWidget):
         self._prefetch_active_locales(silent=True)
         self._apply_account_roster_for_current_app(silent=False)
         self._refresh_accounts_roster_status()
+        self._load_gitlab_project_for_current_app()
         self._fetch_gitlab_brief(app_name=self._summary_app_name or name, force=True, only_if_empty=False)
-        self._auto_fill_xcode_project_for_app(
-            app_name=self._summary_app_name or name,
-            bundle_id=bundle_id if bundle_id != "bundle id не указан" else "",
-        )
 
     def _load_metadata_json(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Выберите JSON с метаданными", "", "JSON Files (*.json);;All Files (*)")
@@ -9701,6 +9687,28 @@ class MainWindow(QWidget):
             name = (getattr(self, "_summary_app_name", "") or "").strip()
         return name
 
+    def _load_gitlab_project_for_current_app(self):
+        if not hasattr(self, "gitlab_project_input"):
+            return
+        app_id = self.app_input.text().strip() if hasattr(self, "app_input") else ""
+        app_name = self._current_app_name_for_gitlab()
+        saved = lookup_gitlab_project_ref(app_id=app_id, app_name=app_name)
+        # Всегда сбрасываем поле при смене приложения — иначе остаётся чужой/старый path.
+        self.gitlab_project_input.setText(saved or "")
+        if saved:
+            self._log(f"GitLab репо из связки: {saved}")
+
+    def _resolve_gitlab_project_ref(self, app_name=""):
+        """Сырой path / id / полный URL — нормализация внутри fetch."""
+        if hasattr(self, "gitlab_project_input"):
+            typed = self.gitlab_project_input.text().strip()
+            if typed:
+                return typed
+        app_id = self.app_input.text().strip() if hasattr(self, "app_input") else ""
+        return lookup_gitlab_project_ref(
+            app_id=app_id,
+            app_name=app_name or self._current_app_name_for_gitlab(),
+        )
     def _fetch_gitlab_brief(self, app_name=None, force=False, only_if_empty=False, on_done=None):
         """Тянет ТЗ из GitLab. on_done(success: bool) вызывается по завершении."""
         if only_if_empty and hasattr(self, "ai_app_context_input"):
@@ -9710,6 +9718,7 @@ class MainWindow(QWidget):
                 return False
 
         name = self._current_app_name_for_gitlab(app_name)
+        project_ref = self._resolve_gitlab_project_ref(name)
         base, token = self._gitlab_credentials()
         if not token:
             msg = "GitLab token не задан (Настройки API)."
@@ -9723,8 +9732,8 @@ class MainWindow(QWidget):
             if on_done:
                 on_done(False)
             return False
-        if not name:
-            msg = "Нет Name приложения для поиска репо в GitLab."
+        if not name and not project_ref:
+            msg = "Нет Name приложения и нет GitLab репо (path group/repo)."
             if hasattr(self, "gitlab_brief_status"):
                 self.gitlab_brief_status.setText(msg)
             if force:
@@ -9735,7 +9744,6 @@ class MainWindow(QWidget):
 
         if self._worker_is_running("gitlab_brief_worker"):
             if on_done:
-                # предыдущий запрос ещё идёт — не блокируем цепочку вечно
                 self._log("GitLab: предыдущий запрос ТЗ ещё выполняется...")
             return False
 
@@ -9743,8 +9751,16 @@ class MainWindow(QWidget):
         if hasattr(self, "btn_fetch_gitlab_brief"):
             self.btn_fetch_gitlab_brief.setEnabled(False)
         if hasattr(self, "gitlab_brief_status"):
-            self.gitlab_brief_status.setText(f"Ищу ТЗ для «{name}»...")
-        worker = GitLabBriefWorker(name, token=token, base_url=base)
+            if project_ref:
+                self.gitlab_brief_status.setText(f"Тяну ТЗ из «{project_ref}»...")
+            else:
+                self.gitlab_brief_status.setText(f"Ищу ТЗ для «{name}»...")
+        worker = GitLabBriefWorker(
+            name,
+            token=token,
+            base_url=base,
+            project_ref=project_ref,
+        )
         worker.log_msg.connect(self._log)
         worker.brief_ready.connect(self._on_gitlab_brief_ready)
         worker.brief_failed.connect(self._on_gitlab_brief_failed)
@@ -9767,7 +9783,8 @@ class MainWindow(QWidget):
                 _done(True)
                 return
         base, token = self._gitlab_credentials()
-        if not token or not self._current_app_name_for_gitlab():
+        has_target = bool(self._current_app_name_for_gitlab() or self._resolve_gitlab_project_ref())
+        if not token or not has_target:
             _done(False)
             return
         started = self._fetch_gitlab_brief(
@@ -9778,7 +9795,6 @@ class MainWindow(QWidget):
         if not started and only_if_empty and self._text_edit_text(self.ai_app_context_input).strip():
             _done(True)
         elif not started:
-            # не удалось стартовать worker — всё равно идём дальше (AI сам ругнётся если пусто)
             _done(False)
 
     def _on_gitlab_brief_ready(self, result):
@@ -9787,6 +9803,14 @@ class MainWindow(QWidget):
         project_path = result.get("project_path") or ""
         if brief and hasattr(self, "ai_app_context_input"):
             self.ai_app_context_input.setPlainText(brief)
+        if project_path and hasattr(self, "gitlab_project_input"):
+            self.gitlab_project_input.setText(project_path)
+        if project_path:
+            remember_gitlab_project_ref(
+                project_path,
+                app_id=self.app_input.text().strip() if hasattr(self, "app_input") else "",
+                app_name=self._current_app_name_for_gitlab(result.get("app_name")),
+            )
         if hasattr(self, "gitlab_brief_status"):
             self.gitlab_brief_status.setText(
                 f"✓ {project_path} · {len(brief)} симв."
@@ -11035,156 +11059,6 @@ class MainWindow(QWidget):
             self.p8_path_input.setText(file_path)
             self._autofill_key_id_from_p8_path()
 
-    def _pick_xcode_projects_root(self):
-        start = ""
-        if hasattr(self, "xcode_projects_root_input"):
-            start = self.xcode_projects_root_input.text().strip()
-        start = start or DEFAULT_XCODE_PROJECTS_ROOT
-        folder = QFileDialog.getExistingDirectory(self, "Корень папок проектов", start)
-        if not folder:
-            return
-        self.xcode_projects_root_input.setText(folder)
-        self._save_env_to_file()
-        self._log(f"Корень Projects: {folder}")
-
-    def _pick_xcode_project_dir(self):
-        start = self.xcode_project_input.text().strip()
-        if not start and hasattr(self, "xcode_projects_root_input"):
-            start = self.xcode_projects_root_input.text().strip()
-        start = start or DEFAULT_XCODE_PROJECTS_ROOT
-        folder = QFileDialog.getExistingDirectory(self, "Папка Xcode-проекта", start)
-        if not folder:
-            return
-        self.xcode_project_input.setText(folder)
-        self._save_env_to_file()
-        self._detect_xcode_scheme(silent=True)
-
-    def _auto_fill_xcode_project_for_app(self, app_name="", bundle_id=""):
-        """После выбора App ID — подставить папку проекта по имени из корня Projects."""
-        if not hasattr(self, "xcode_project_input"):
-            return
-        app_name = (app_name or getattr(self, "_summary_app_name", "") or "").strip()
-        if not app_name:
-            return
-        root = resolve_xcode_projects_root()
-        if hasattr(self, "xcode_projects_root_input"):
-            root = self.xcode_projects_root_input.text().strip() or root
-        found = find_xcode_project_dir_by_app_name(app_name, root, bundle_id=bundle_id or "")
-        if not found:
-            self._log(
-                f"Xcode проект: в «{root}» не найдена папка для «{app_name}» "
-                f"(ожидается имя вроде Spillwheel / River-Aspect)."
-            )
-            if hasattr(self, "xcode_build_status"):
-                self.xcode_build_status.setText(
-                    f"Проект не найден для «{app_name}» в {root}"
-                )
-            return
-        self.xcode_project_input.setText(found)
-        self._save_env_to_file()
-        self._log(f"Xcode проект по имени «{app_name}»: {found}")
-        if hasattr(self, "xcode_build_status"):
-            self.xcode_build_status.setText(f"Проект: {found}")
-        self._detect_xcode_scheme(silent=True)
-
-    def _detect_xcode_scheme(self, silent=False):
-        project_dir = self.xcode_project_input.text().strip()
-        if not project_dir:
-            if not silent:
-                QMessageBox.warning(self, "Билд IPA", "Укажите папку Xcode-проекта.")
-            return
-        try:
-            project_path = find_xcodeproj(project_dir)
-            scheme = discover_scheme(project_path, self.xcode_scheme_input.text().strip())
-            self.xcode_scheme_input.setText(scheme)
-            self._save_env_to_file()
-            msg = f"Scheme: {scheme} ({os.path.basename(project_path)})"
-            self.xcode_build_status.setText(msg)
-            self._log(msg)
-        except Exception as e:
-            if not silent:
-                QMessageBox.warning(self, "Билд IPA", str(e))
-            self._log(f"Билд IPA: не удалось определить scheme — {e}")
-
-    def _start_xcode_ipa_build(self, upload=False):
-        if sys.platform != "darwin":
-            QMessageBox.warning(self, "Билд IPA", "Только macOS + Xcode.")
-            return
-        if getattr(self, "xcode_ipa_worker", None) and self.xcode_ipa_worker.isRunning():
-            QMessageBox.information(self, "Билд IPA", "Сборка уже идёт.")
-            return
-
-        project_dir = self.xcode_project_input.text().strip()
-        if not project_dir:
-            QMessageBox.warning(self, "Билд IPA", "Укажите папку Xcode-проекта.")
-            return
-
-        issuer = self.issuer_input.text().strip()
-        key_id = self.key_input.text().strip()
-        p8 = self.p8_path_input.text().strip()
-        app_id = self.app_input.text().strip()
-        bump = self.xcode_bump_build_checkbox.isChecked()
-        need_asc = bump or upload
-        if need_asc and not (issuer and key_id and p8 and app_id):
-            QMessageBox.warning(
-                self,
-                "Билд IPA",
-                "Для build number / заливки заполните Issuer ID, Key ID, .p8 и App ID "
-                "на вкладке «Настройки API».",
-            )
-            return
-
-        self._save_env_to_file()
-        action = "сборка + заливка" if upload else "сборка IPA"
-        self.xcode_build_status.setText(f"Идёт {action}… смотрите лог внизу.")
-        self.btn_xcode_build_only.setEnabled(False)
-        self.btn_xcode_build_upload.setEnabled(False)
-        self._log(f"——— Билд IPA: старт ({action}) ———")
-
-        options = {
-            "project_dir": project_dir,
-            "scheme": self.xcode_scheme_input.text().strip(),
-            "team_id": self.xcode_team_input.text().strip(),
-            "issuer_id": issuer,
-            "key_id": key_id,
-            "private_key_path": p8,
-            "app_id": app_id,
-            "bump_build": bump,
-            "upload": upload,
-            "scan_leaks": self.xcode_scan_leaks_checkbox.isChecked(),
-            "run_bulder": self.xcode_run_bulder_checkbox.isChecked(),
-            "need_asc": need_asc,
-        }
-        self.xcode_ipa_worker = XcodeIpaWorker(options)
-        self.xcode_ipa_worker.log_msg.connect(self._log)
-        self.xcode_ipa_worker.build_ok.connect(self._on_xcode_ipa_ok)
-        self.xcode_ipa_worker.build_failed.connect(self._on_xcode_ipa_failed)
-        self.xcode_ipa_worker.finished.connect(self._on_xcode_ipa_finished)
-        self.xcode_ipa_worker.start()
-
-    def _on_xcode_ipa_ok(self, result):
-        ipa = (result or {}).get("ipa_path", "")
-        uploaded = (result or {}).get("uploaded")
-        build_no = (result or {}).get("build_number")
-        parts = [f"Готово: {ipa}" if ipa else "Готово."]
-        if build_no is not None:
-            parts.append(f"build {build_no}")
-        if uploaded:
-            parts.append("залит в App Store Connect")
-        msg = " · ".join(parts)
-        self.xcode_build_status.setText(msg)
-        self._log(msg)
-        QMessageBox.information(self, "Билд IPA", msg)
-
-    def _on_xcode_ipa_failed(self, err):
-        self.xcode_build_status.setText(f"Ошибка: {err}")
-        self._log(f"Билд IPA ошибка: {err}")
-        QMessageBox.critical(self, "Билд IPA", str(err)[:2000])
-
-    def _on_xcode_ipa_finished(self):
-        self.btn_xcode_build_only.setEnabled(True)
-        self.btn_xcode_build_upload.setEnabled(True)
-
     def _select_folder(self, variant, button=None):
         folder = QFileDialog.getExistingDirectory(self, f"Выберите папку для {variant}")
         if folder:
@@ -11360,14 +11234,6 @@ class MainWindow(QWidget):
             env_content += f"GITLAB_URL={self.gitlab_url_input.text().strip()}\n"
         if hasattr(self, "gitlab_token_input"):
             env_content += f"GITLAB_TOKEN={self.gitlab_token_input.text().strip()}\n"
-        if hasattr(self, "xcode_project_input"):
-            env_content += f"XCODE_PROJECT_PATH={self.xcode_project_input.text().strip()}\n"
-        if hasattr(self, "xcode_projects_root_input"):
-            env_content += f"XCODE_PROJECTS_ROOT={self.xcode_projects_root_input.text().strip()}\n"
-        if hasattr(self, "xcode_scheme_input"):
-            env_content += f"XCODE_SCHEME={self.xcode_scheme_input.text().strip()}\n"
-        if hasattr(self, "xcode_team_input"):
-            env_content += f"XCODE_TEAM_ID={self.xcode_team_input.text().strip()}\n"
         if hasattr(self, "ai_provider_combo"):
             env_content += f"AI_PROVIDER={self._selected_ai_provider()}\n"
         if hasattr(self, "aitunnel_key_input"):

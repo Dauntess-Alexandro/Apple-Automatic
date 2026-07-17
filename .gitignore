@@ -1,6 +1,7 @@
 .env
 .flags_cache
 .accounts_roster.json
+.gitlab_project_map.json
 .venv/
 dist/
 __pycache__/
