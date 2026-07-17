@@ -19,6 +19,12 @@ from PIL import Image, ImageOps
 from dotenv import load_dotenv
 import yaml
 from image_optimize import LocalImageOptimizer
+from xcode_ipa_build import (
+    build_and_optionally_upload,
+    discover_scheme,
+    find_xcode_project_dir_by_app_name,
+    find_xcodeproj,
+)
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QLineEdit, QPushButton, QTextEdit, QFileDialog, QLabel, QGroupBox,
@@ -62,6 +68,8 @@ ZERODEPLOY_DROP_URL = "https://api.zerodeploy.dev/drop"
 LITTERBOX_UPLOAD_URL = "https://litterbox.catbox.moe/resources/internals/api.php"
 GITLAB_APPLE_CONNECT_PATH = ".metadata/apple-connect.yaml"
 GITLAB_DEFAULT_REF = "main"
+DEFAULT_XCODE_PROJECTS_ROOT = os.path.expanduser("~/Downloads/Projects")
+DEFAULT_XCODE_PROJECT_PATH = ""  # подставляется по имени после «Загрузить App ID»
 
 AITUNNEL_API_BASE = os.getenv("AITUNNEL_API_BASE", "https://api.aitunnel.ru/v1").rstrip("/")
 AITUNNEL_MODELS_URL = "https://api.aitunnel.ru/public/aitunnel/models/chat"
@@ -618,6 +626,41 @@ def resolve_gitlab_token():
     return (
         env_file.get("GITLAB_TOKEN", "").strip()
         or os.getenv("GITLAB_TOKEN", "").strip()
+    )
+
+
+def resolve_xcode_projects_root():
+    env_file = _read_env_file()
+    return (
+        env_file.get("XCODE_PROJECTS_ROOT", "").strip()
+        or os.getenv("XCODE_PROJECTS_ROOT", "").strip()
+        or DEFAULT_XCODE_PROJECTS_ROOT
+    )
+
+
+def resolve_xcode_project_path():
+    env_file = _read_env_file()
+    return (
+        env_file.get("XCODE_PROJECT_PATH", "").strip()
+        or os.getenv("XCODE_PROJECT_PATH", "").strip()
+        or DEFAULT_XCODE_PROJECT_PATH
+    )
+
+
+def resolve_xcode_scheme():
+    env_file = _read_env_file()
+    return (
+        env_file.get("XCODE_SCHEME", "").strip()
+        or os.getenv("XCODE_SCHEME", "").strip()
+    )
+
+
+def resolve_xcode_team_id():
+    env_file = _read_env_file()
+    return (
+        env_file.get("XCODE_TEAM_ID", "").strip()
+        or os.getenv("XCODE_TEAM_ID", "").strip()
+        or os.getenv("DEVELOPMENT_TEAM", "").strip()
     )
 
 
@@ -5068,6 +5111,51 @@ class GitLabBriefWorker(QThread):
             self.finished.emit()
 
 
+class XcodeIpaWorker(QThread):
+    """Локальный аналог Codemagic: archive → IPA → (опционально) upload."""
+    log_msg = Signal(str)
+    build_ok = Signal(dict)
+    build_failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, options):
+        super().__init__()
+        self.options = options or {}
+
+    def run(self):
+        try:
+            opts = self.options
+            asc_client = None
+            if opts.get("bump_build") or opts.get("need_asc"):
+                asc_client = ASCClient(
+                    opts["issuer_id"],
+                    opts["key_id"],
+                    opts["private_key_path"],
+                    opts["app_id"],
+                    lambda msg: self.log_msg.emit(msg),
+                )
+            result = build_and_optionally_upload(
+                project_dir=opts.get("project_dir", ""),
+                scheme=opts.get("scheme", ""),
+                team_id=opts.get("team_id", ""),
+                apple_id=opts.get("app_id", ""),
+                issuer_id=opts.get("issuer_id", ""),
+                key_id=opts.get("key_id", ""),
+                private_key_path=opts.get("private_key_path", ""),
+                bump_build=bool(opts.get("bump_build")),
+                upload=bool(opts.get("upload")),
+                scan_leaks=bool(opts.get("scan_leaks")),
+                run_bulder=bool(opts.get("run_bulder")),
+                asc_client=asc_client,
+                log=lambda msg: self.log_msg.emit(msg),
+            )
+            self.build_ok.emit(result)
+        except Exception as e:
+            self.build_failed.emit(str(e))
+        finally:
+            self.finished.emit()
+
+
 class GeminiMetadataWorker(QThread):
     log_msg = Signal(str)
     metadata_generated = Signal(dict)
@@ -7605,6 +7693,108 @@ class MainWindow(QWidget):
         feedback_layout.addWidget(self.feedback_table, stretch=1)
         self.tabs.addTab(self.tab_feedback, "Feedback", "💬")
 
+        self.tab_build = QWidget()
+        build_outer = QVBoxLayout(self.tab_build)
+        build_outer.setContentsMargins(0, 0, 0, 0)
+        build_outer.setSpacing(0)
+        build_scroll = QScrollArea()
+        build_scroll.setWidgetResizable(True)
+        build_scroll.setFrameShape(QFrame.NoFrame)
+        build_inner = QWidget()
+        build_layout = QVBoxLayout(build_inner)
+        build_layout.setSpacing(12)
+        build_layout.setContentsMargins(4, 4, 12, 12)
+        build_scroll.setWidget(build_inner)
+        build_outer.addWidget(build_scroll)
+        build_layout.addWidget(make_page_header(
+            "Билд IPA (вместо Codemagic)",
+            "На этом Mac: Pushwoosh-скрипт → +1 build → Archive → IPA → заливка в App Store Connect. "
+            "После «Загрузить App ID» папка проекта подставляется автоматически по имени из "
+            "корня Projects (как GitLab)."
+        ))
+        if sys.platform != "darwin":
+            mac_only = QLabel("⚠ Сборка IPA работает только на macOS с установленным Xcode.")
+            mac_only.setProperty("role", "hint")
+            mac_only.setWordWrap(True)
+            build_layout.addWidget(mac_only)
+
+        self.xcode_projects_root_input = QLineEdit(resolve_xcode_projects_root())
+        self.xcode_projects_root_input.setPlaceholderText("Корень папок проектов, напр. ~/Downloads/Projects")
+        self.xcode_projects_root_input.editingFinished.connect(self._save_env_to_file)
+        self.btn_pick_xcode_projects_root = QPushButton("Корень…")
+        self.btn_pick_xcode_projects_root.setObjectName("utility_btn")
+        self.btn_pick_xcode_projects_root.setMinimumWidth(100)
+        self.btn_pick_xcode_projects_root.clicked.connect(self._pick_xcode_projects_root)
+        _add_labeled_fields_row(
+            build_layout,
+            [("Корень Projects", self.xcode_projects_root_input)],
+            trailing_widget=self.btn_pick_xcode_projects_root,
+        )
+
+        self.xcode_project_input = QLineEdit(resolve_xcode_project_path())
+        self.xcode_project_input.setPlaceholderText("Папка Xcode-проекта (где .xcodeproj) — авто после App ID")
+        self.xcode_project_input.editingFinished.connect(self._save_env_to_file)
+        self.btn_pick_xcode_project = QPushButton("Выбрать папку")
+        self.btn_pick_xcode_project.setObjectName("utility_btn")
+        self.btn_pick_xcode_project.setMinimumWidth(140)
+        self.btn_pick_xcode_project.clicked.connect(self._pick_xcode_project_dir)
+        _add_labeled_fields_row(
+            build_layout,
+            [("Xcode проект", self.xcode_project_input)],
+            trailing_widget=self.btn_pick_xcode_project,
+        )
+
+        self.xcode_scheme_input = QLineEdit(resolve_xcode_scheme())
+        self.xcode_scheme_input.setPlaceholderText("Scheme (пусто = авто)")
+        self.xcode_scheme_input.editingFinished.connect(self._save_env_to_file)
+        self.xcode_team_input = QLineEdit(resolve_xcode_team_id())
+        self.xcode_team_input.setPlaceholderText("Team ID (пусто = из Bulder-скрипта / Xcode)")
+        self.xcode_team_input.editingFinished.connect(self._save_env_to_file)
+        _add_labeled_fields_row(
+            build_layout,
+            [("Scheme", self.xcode_scheme_input), ("Team ID", self.xcode_team_input)],
+        )
+
+        self.xcode_run_bulder_checkbox = QCheckBox(
+            "Запустить Scripts/bulder_pushwoosh_build_config.py (как в Codemagic)"
+        )
+        self.xcode_run_bulder_checkbox.setChecked(True)
+        self.xcode_bump_build_checkbox = QCheckBox("+1 к build number из App Store Connect (agvtool)")
+        self.xcode_bump_build_checkbox.setChecked(True)
+        self.xcode_scan_leaks_checkbox = QCheckBox(
+            "Проверить утечки перед сборкой (IP, /Users/…, MAC) — только лог, не удаляет"
+        )
+        self.xcode_scan_leaks_checkbox.setChecked(True)
+        build_layout.addWidget(self.xcode_run_bulder_checkbox)
+        build_layout.addWidget(self.xcode_bump_build_checkbox)
+        build_layout.addWidget(self.xcode_scan_leaks_checkbox)
+
+        build_btns = QHBoxLayout()
+        self.btn_xcode_detect = QPushButton("Определить scheme")
+        self.btn_xcode_detect.setObjectName("utility_btn")
+        self.btn_xcode_detect.clicked.connect(self._detect_xcode_scheme)
+        self.btn_xcode_build_only = QPushButton("Собрать IPA")
+        self.btn_xcode_build_only.setObjectName("utility_btn")
+        self.btn_xcode_build_only.setMinimumHeight(44)
+        self.btn_xcode_build_only.clicked.connect(lambda: self._start_xcode_ipa_build(upload=False))
+        self.btn_xcode_build_upload = QPushButton("🚀 Собрать и залить в App Store")
+        self.btn_xcode_build_upload.setObjectName("main_generate_btn")
+        self.btn_xcode_build_upload.setMinimumHeight(50)
+        self.btn_xcode_build_upload.clicked.connect(lambda: self._start_xcode_ipa_build(upload=True))
+        build_btns.addWidget(self.btn_xcode_detect)
+        build_btns.addWidget(self.btn_xcode_build_only, 1)
+        build_btns.addWidget(self.btn_xcode_build_upload, 2)
+        build_layout.addLayout(build_btns)
+
+        self.xcode_build_status = QLabel(
+            "IPA сохранится в <проект>/build/ppo_ipa/. Подпись — automatic (нужен вход в Xcode → Accounts)."
+        )
+        self.xcode_build_status.setProperty("role", "hint")
+        self.xcode_build_status.setWordWrap(True)
+        build_layout.addWidget(self.xcode_build_status)
+        build_layout.addStretch(1)
+        self.tabs.addTab(self.tab_build, "Билд IPA", "📦")
+
         self.tab_accounts = QWidget()
         accounts_layout = QVBoxLayout(self.tab_accounts)
         accounts_layout.setContentsMargins(4, 4, 4, 4)
@@ -8960,6 +9150,10 @@ class MainWindow(QWidget):
         self._apply_account_roster_for_current_app(silent=False)
         self._refresh_accounts_roster_status()
         self._fetch_gitlab_brief(app_name=self._summary_app_name or name, force=True, only_if_empty=False)
+        self._auto_fill_xcode_project_for_app(
+            app_name=self._summary_app_name or name,
+            bundle_id=bundle_id if bundle_id != "bundle id не указан" else "",
+        )
 
     def _load_metadata_json(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Выберите JSON с метаданными", "", "JSON Files (*.json);;All Files (*)")
@@ -10841,6 +11035,156 @@ class MainWindow(QWidget):
             self.p8_path_input.setText(file_path)
             self._autofill_key_id_from_p8_path()
 
+    def _pick_xcode_projects_root(self):
+        start = ""
+        if hasattr(self, "xcode_projects_root_input"):
+            start = self.xcode_projects_root_input.text().strip()
+        start = start or DEFAULT_XCODE_PROJECTS_ROOT
+        folder = QFileDialog.getExistingDirectory(self, "Корень папок проектов", start)
+        if not folder:
+            return
+        self.xcode_projects_root_input.setText(folder)
+        self._save_env_to_file()
+        self._log(f"Корень Projects: {folder}")
+
+    def _pick_xcode_project_dir(self):
+        start = self.xcode_project_input.text().strip()
+        if not start and hasattr(self, "xcode_projects_root_input"):
+            start = self.xcode_projects_root_input.text().strip()
+        start = start or DEFAULT_XCODE_PROJECTS_ROOT
+        folder = QFileDialog.getExistingDirectory(self, "Папка Xcode-проекта", start)
+        if not folder:
+            return
+        self.xcode_project_input.setText(folder)
+        self._save_env_to_file()
+        self._detect_xcode_scheme(silent=True)
+
+    def _auto_fill_xcode_project_for_app(self, app_name="", bundle_id=""):
+        """После выбора App ID — подставить папку проекта по имени из корня Projects."""
+        if not hasattr(self, "xcode_project_input"):
+            return
+        app_name = (app_name or getattr(self, "_summary_app_name", "") or "").strip()
+        if not app_name:
+            return
+        root = resolve_xcode_projects_root()
+        if hasattr(self, "xcode_projects_root_input"):
+            root = self.xcode_projects_root_input.text().strip() or root
+        found = find_xcode_project_dir_by_app_name(app_name, root, bundle_id=bundle_id or "")
+        if not found:
+            self._log(
+                f"Xcode проект: в «{root}» не найдена папка для «{app_name}» "
+                f"(ожидается имя вроде Spillwheel / River-Aspect)."
+            )
+            if hasattr(self, "xcode_build_status"):
+                self.xcode_build_status.setText(
+                    f"Проект не найден для «{app_name}» в {root}"
+                )
+            return
+        self.xcode_project_input.setText(found)
+        self._save_env_to_file()
+        self._log(f"Xcode проект по имени «{app_name}»: {found}")
+        if hasattr(self, "xcode_build_status"):
+            self.xcode_build_status.setText(f"Проект: {found}")
+        self._detect_xcode_scheme(silent=True)
+
+    def _detect_xcode_scheme(self, silent=False):
+        project_dir = self.xcode_project_input.text().strip()
+        if not project_dir:
+            if not silent:
+                QMessageBox.warning(self, "Билд IPA", "Укажите папку Xcode-проекта.")
+            return
+        try:
+            project_path = find_xcodeproj(project_dir)
+            scheme = discover_scheme(project_path, self.xcode_scheme_input.text().strip())
+            self.xcode_scheme_input.setText(scheme)
+            self._save_env_to_file()
+            msg = f"Scheme: {scheme} ({os.path.basename(project_path)})"
+            self.xcode_build_status.setText(msg)
+            self._log(msg)
+        except Exception as e:
+            if not silent:
+                QMessageBox.warning(self, "Билд IPA", str(e))
+            self._log(f"Билд IPA: не удалось определить scheme — {e}")
+
+    def _start_xcode_ipa_build(self, upload=False):
+        if sys.platform != "darwin":
+            QMessageBox.warning(self, "Билд IPA", "Только macOS + Xcode.")
+            return
+        if getattr(self, "xcode_ipa_worker", None) and self.xcode_ipa_worker.isRunning():
+            QMessageBox.information(self, "Билд IPA", "Сборка уже идёт.")
+            return
+
+        project_dir = self.xcode_project_input.text().strip()
+        if not project_dir:
+            QMessageBox.warning(self, "Билд IPA", "Укажите папку Xcode-проекта.")
+            return
+
+        issuer = self.issuer_input.text().strip()
+        key_id = self.key_input.text().strip()
+        p8 = self.p8_path_input.text().strip()
+        app_id = self.app_input.text().strip()
+        bump = self.xcode_bump_build_checkbox.isChecked()
+        need_asc = bump or upload
+        if need_asc and not (issuer and key_id and p8 and app_id):
+            QMessageBox.warning(
+                self,
+                "Билд IPA",
+                "Для build number / заливки заполните Issuer ID, Key ID, .p8 и App ID "
+                "на вкладке «Настройки API».",
+            )
+            return
+
+        self._save_env_to_file()
+        action = "сборка + заливка" if upload else "сборка IPA"
+        self.xcode_build_status.setText(f"Идёт {action}… смотрите лог внизу.")
+        self.btn_xcode_build_only.setEnabled(False)
+        self.btn_xcode_build_upload.setEnabled(False)
+        self._log(f"——— Билд IPA: старт ({action}) ———")
+
+        options = {
+            "project_dir": project_dir,
+            "scheme": self.xcode_scheme_input.text().strip(),
+            "team_id": self.xcode_team_input.text().strip(),
+            "issuer_id": issuer,
+            "key_id": key_id,
+            "private_key_path": p8,
+            "app_id": app_id,
+            "bump_build": bump,
+            "upload": upload,
+            "scan_leaks": self.xcode_scan_leaks_checkbox.isChecked(),
+            "run_bulder": self.xcode_run_bulder_checkbox.isChecked(),
+            "need_asc": need_asc,
+        }
+        self.xcode_ipa_worker = XcodeIpaWorker(options)
+        self.xcode_ipa_worker.log_msg.connect(self._log)
+        self.xcode_ipa_worker.build_ok.connect(self._on_xcode_ipa_ok)
+        self.xcode_ipa_worker.build_failed.connect(self._on_xcode_ipa_failed)
+        self.xcode_ipa_worker.finished.connect(self._on_xcode_ipa_finished)
+        self.xcode_ipa_worker.start()
+
+    def _on_xcode_ipa_ok(self, result):
+        ipa = (result or {}).get("ipa_path", "")
+        uploaded = (result or {}).get("uploaded")
+        build_no = (result or {}).get("build_number")
+        parts = [f"Готово: {ipa}" if ipa else "Готово."]
+        if build_no is not None:
+            parts.append(f"build {build_no}")
+        if uploaded:
+            parts.append("залит в App Store Connect")
+        msg = " · ".join(parts)
+        self.xcode_build_status.setText(msg)
+        self._log(msg)
+        QMessageBox.information(self, "Билд IPA", msg)
+
+    def _on_xcode_ipa_failed(self, err):
+        self.xcode_build_status.setText(f"Ошибка: {err}")
+        self._log(f"Билд IPA ошибка: {err}")
+        QMessageBox.critical(self, "Билд IPA", str(err)[:2000])
+
+    def _on_xcode_ipa_finished(self):
+        self.btn_xcode_build_only.setEnabled(True)
+        self.btn_xcode_build_upload.setEnabled(True)
+
     def _select_folder(self, variant, button=None):
         folder = QFileDialog.getExistingDirectory(self, f"Выберите папку для {variant}")
         if folder:
@@ -11016,6 +11360,14 @@ class MainWindow(QWidget):
             env_content += f"GITLAB_URL={self.gitlab_url_input.text().strip()}\n"
         if hasattr(self, "gitlab_token_input"):
             env_content += f"GITLAB_TOKEN={self.gitlab_token_input.text().strip()}\n"
+        if hasattr(self, "xcode_project_input"):
+            env_content += f"XCODE_PROJECT_PATH={self.xcode_project_input.text().strip()}\n"
+        if hasattr(self, "xcode_projects_root_input"):
+            env_content += f"XCODE_PROJECTS_ROOT={self.xcode_projects_root_input.text().strip()}\n"
+        if hasattr(self, "xcode_scheme_input"):
+            env_content += f"XCODE_SCHEME={self.xcode_scheme_input.text().strip()}\n"
+        if hasattr(self, "xcode_team_input"):
+            env_content += f"XCODE_TEAM_ID={self.xcode_team_input.text().strip()}\n"
         if hasattr(self, "ai_provider_combo"):
             env_content += f"AI_PROVIDER={self._selected_ai_provider()}\n"
         if hasattr(self, "aitunnel_key_input"):
