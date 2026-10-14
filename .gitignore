@@ -8,3 +8,8 @@ __pycache__/
 *.pyc
 .DS_Store
 .vscode/
+
+.build-signing/
+.build_upload.json
+.build_upload.json.tmp
+.superpowers/

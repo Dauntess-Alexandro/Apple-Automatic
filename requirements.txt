@@ -1,6 +1,8 @@
 Pillow
-PyJWT
+PyJWT[crypto]
 PySide6
 PyYAML
 python-dotenv
 requests
+
+PyNaCl>=1.5,<2

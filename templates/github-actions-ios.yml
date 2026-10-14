@@ -1,0 +1,344 @@
+# Portable iOS workflow. Copy this ONE file to .github/workflows/universal-ios.yml
+# in the root of each GitHub repository (not just next to pubspec.yaml).
+# Flutter + native Swift/Objective-C with a committed .xcodeproj and shared scheme.
+# Secrets: APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER,
+# APP_STORE_CONNECT_PRIVATE_KEY (.p8 contents), CERTIFICATE_PRIVATE_KEY (RSA PEM).
+# API key must belong to the app's Apple account and allow signing/upload.
+# Builds go to App Store Connect / TestFlight; App Review is a separate operation.
+# actions/upload-artifact is pinned to v6 (Node.js 24).
+# Xcode version comes from macos-26; pin the runner/Xcode for projects that need it.
+name: IOS BUILD
+'on':
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: Bundle ID приложения, например com.company.app
+        type: string
+        required: true
+      app_store_apple_id:
+        description: Числовой Apple App ID из App Store Connect
+        type: string
+        required: true
+      project_path:
+        description: Папка приложения от корня репозитория; auto = поиск
+        type: string
+        default: auto
+      xcode_scheme:
+        description: Общая схема Xcode; auto = поиск (для Flutter не нужна)
+        type: string
+        default: auto
+      xcode_container:
+        description: Путь к .xcworkspace/.xcodeproj; auto = поиск
+        type: string
+        default: auto
+      flutter_version:
+        description: Версия Flutter; для Swift/Objective-C не используется
+        type: string
+        default: 3.47.0
+      run_tests:
+        description: Запустить Flutter-тесты, если они есть
+        type: boolean
+        default: true
+      upload_to_testflight:
+        description: Загрузить в App Store Connect / TestFlight
+        type: boolean
+        default: true
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ios-app-store-connect
+  cancel-in-progress: false
+env:
+  APP_DIRECTORY: .
+  BUNDLE_ID: ${{ inputs.bundle_id }}
+  APP_STORE_APPLE_ID: ${{ inputs.app_store_apple_id }}
+  PROJECT_PATH_INPUT: ${{ inputs.project_path }}
+  XCODE_SCHEME_INPUT: ${{ inputs.xcode_scheme }}
+  XCODE_CONTAINER_INPUT: ${{ inputs.xcode_container }}
+jobs:
+  credentials:
+    name: Check Apple credentials
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+    - name: Check required repository secrets
+      shell: bash
+      env:
+        APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        APP_STORE_CONNECT_KEY_IDENTIFIER: ${{ secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
+        APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        CERTIFICATE_PRIVATE_KEY: ${{ secrets.CERTIFICATE_PRIVATE_KEY }}
+      run: |
+        set -euo pipefail
+        for name in APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_IDENTIFIER APP_STORE_CONNECT_PRIVATE_KEY CERTIFICATE_PRIVATE_KEY; do
+          if [[ -z "${!name}" ]]; then
+            echo "::error::Missing repository secret $name."
+            exit 1
+          fi
+        done
+  build:
+    name: Build and upload iOS
+    needs: credentials
+    runs-on: macos-26
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.APP_DIRECTORY }}
+    steps:
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+    - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+      with:
+        python-version: '3.12'
+    - name: Detect iOS project
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+        python - <<'PYDETECT'
+        import os, re
+        from pathlib import Path
+        root = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+        requested = os.environ['PROJECT_PATH_INPUT']
+        bundle = os.environ['BUNDLE_ID']
+        if not re.fullmatch(r'[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+', bundle):
+            raise SystemExit('Enter a valid Bundle ID.')
+        if not os.environ['APP_STORE_APPLE_ID'].isdigit():
+            raise SystemExit('Apple App ID must be numeric.')
+        ignored = {'.git', '.dart_tool', 'build', 'Pods', 'node_modules', 'packages', 'shared', 'example', 'test', '.symlinks', 'vendor', '.venv'}
+        def safe(path):
+            path = path.resolve()
+            if not path.is_relative_to(root) or any(c in str(path) for c in '\r\n'):
+                raise SystemExit('Project paths must stay inside the repository and contain no newlines.')
+            return path
+        def flutter(path):
+            manifest = path / 'pubspec.yaml'
+            return (manifest.is_file() and re.search(r'sdk:\s*flutter\b', manifest.read_text())
+                    and (path / 'lib/main.dart').is_file() and (path / 'ios').is_dir())
+        def matches(project):
+            pbx = project / 'project.pbxproj'
+            return pbx.is_file() and bundle in re.findall(r'PRODUCT_BUNDLE_IDENTIFIER\s*=\s*"?([A-Za-z0-9_.-]+)"?\s*;', pbx.read_text())
+        if requested != 'auto':
+            if Path(requested).is_absolute():
+                raise SystemExit('project_path must be relative to the repository root.')
+            search = safe(root / requested)
+            if not search.is_dir():
+                raise SystemExit('Requested project folder does not exist.')
+        else:
+            search = root
+        candidates = set()
+        flutter_roots = set()
+        projects = []
+        for current, directories, files in os.walk(search, followlinks=False):
+            path = safe(Path(current))
+            directories[:] = [d for d in directories if d not in ignored and not (path / d).is_symlink()]
+            if flutter(path):
+                project = path / 'ios/Runner.xcodeproj'
+                if matches(project):
+                    candidates.add((path, 'flutter'))
+                flutter_roots.add(path)
+                directories[:] = []
+                continue
+            for directory in list(directories):
+                if directory.endswith('.xcodeproj'):
+                    project = safe(path / directory)
+                    if matches(project):
+                        candidates.add((path, 'xcode'))
+                        projects.append(project)
+                    directories.remove(directory)
+                elif directory.endswith('.xcworkspace'):
+                    directories.remove(directory)
+        if len(candidates) != 1:
+            print('Matching app folders:', ', '.join(str(p.relative_to(root)) for p,t in sorted(candidates)))
+            raise SystemExit(f'Expected one iOS app with Bundle ID {bundle}; found {len(candidates)}. Set project_path explicitly.')
+        app, kind = candidates.pop()
+        values = {'APP_DIRECTORY': str(app), 'APP_TYPE': kind}
+        if kind == 'xcode':
+            scheme_files = sorted(set(list(app.glob('*.xcworkspace/xcshareddata/xcschemes/*.xcscheme')) + list(app.glob('*.xcodeproj/xcshareddata/xcschemes/*.xcscheme'))))
+            scheme_names = {p.stem for p in scheme_files}
+            scheme = os.environ['XCODE_SCHEME_INPUT']
+            if scheme == 'auto':
+                if len(scheme_names) != 1:
+                    raise SystemExit('Expected one shared Xcode scheme. Set xcode_scheme and commit the shared scheme.')
+                scheme = scheme_names.pop()
+            if scheme not in {p.stem for p in scheme_files} or any(c in scheme for c in '\r\n'):
+                raise SystemExit('Selected scheme is not shared in this project.')
+            values.update(XCODE_SCHEME=scheme)
+        with open(os.environ['GITHUB_ENV'], 'a') as stream:
+            for name,value in values.items():
+                stream.write(f'{name}={value}\n')
+        print(f'Detected {kind} app: {app.relative_to(root)}')
+        PYDETECT
+    - name: Set up Flutter
+      uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+      with:
+        flutter-version: ${{ inputs.flutter_version }}
+        channel: stable
+        cache: true
+      if: env.APP_TYPE == 'flutter'
+    - name: Install release tools and dependencies
+      run: |
+        set -euo pipefail
+        python -m pip install codemagic-cli-tools==0.70.0
+        if [[ "$APP_TYPE" == "flutter" ]]; then
+          flutter pub get
+        else
+          if [[ -f Podfile ]]; then
+            pod install
+          fi
+        fi
+    - name: Resolve Xcode container
+      if: env.APP_TYPE == 'xcode'
+      run: |
+        set -euo pipefail
+        python - <<'PYCONTAINER'
+        import os, re
+        from pathlib import Path
+        root = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+        app = Path(os.environ['APP_DIRECTORY']).resolve()
+        requested = os.environ['XCODE_CONTAINER_INPUT']
+        def safe(path):
+            path = path.resolve()
+            if not path.is_relative_to(root) or any(c in str(path) for c in '\r\n'):
+                raise SystemExit('Xcode container must stay inside the repository.')
+            return path
+        if requested != 'auto':
+            if Path(requested).is_absolute():
+                raise SystemExit('xcode_container must be relative to the repository root.')
+            container = safe(root / requested)
+            if container.parent != app or container.suffix not in ('.xcworkspace', '.xcodeproj') or not container.is_dir():
+                raise SystemExit('Selected Xcode workspace/project does not exist after dependency installation.')
+        else:
+            workspaces = sorted(p for p in app.glob('*.xcworkspace') if not p.name.startswith('Pods') and not p.is_symlink())
+            projects = []
+            for project in sorted(app.glob('*.xcodeproj')):
+                pbx = project / 'project.pbxproj'
+                if pbx.is_file() and os.environ['BUNDLE_ID'] in re.findall(r'PRODUCT_BUNDLE_IDENTIFIER\s*=\s*"?([A-Za-z0-9_.-]+)"?\s*;', pbx.read_text()):
+                    projects.append(project)
+            containers = workspaces or projects
+            if len(containers) != 1:
+                raise SystemExit('Expected one Xcode container after dependency installation. Set xcode_container explicitly.')
+            container = safe(containers[0])
+        with open(os.environ['GITHUB_ENV'], 'a') as stream:
+            stream.write(f'XCODE_CONTAINER={container}\n')
+        print(f'Xcode container: {container.relative_to(root)}')
+        PYCONTAINER
+    - name: Run tests
+      run: |
+        set -euo pipefail
+        if [[ "$APP_TYPE" == "flutter" ]]; then
+          if [[ -d test ]] && find test -name '*_test.dart' -print -quit | grep -q .; then
+            flutter test
+          else
+            echo 'No Flutter tests in this project.'
+          fi
+        else
+          echo 'Native tests require a project-specific simulator/test plan. Add an xcodebuild test step for your project before signing.'
+        fi
+      if: ${{ inputs.run_tests }}
+    - name: Set up signing and next build number
+      env:
+        APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        APP_STORE_CONNECT_KEY_IDENTIFIER: ${{ secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
+        APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        CERTIFICATE_PRIVATE_KEY: ${{ secrets.CERTIFICATE_PRIVATE_KEY }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        keychain initialize
+        app-store-connect fetch-signing-files "$BUNDLE_ID" --type IOS_APP_STORE --create
+        keychain add-certificates
+        xcode-project use-profiles --export-options-plist "$RUNNER_TEMP/export_options.plist"
+        latest="$(app-store-connect get-latest-build-number "$APP_STORE_APPLE_ID" --platform IOS --all-versions)"
+        latest="${latest:-0}"
+        if [[ ! "$latest" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+          echo '::error::Apple returned an invalid build number.'
+          exit 1
+        fi
+        artifact_latest="$(python - <<'PYARTIFACT'
+        import json, os, re, urllib.request
+        url = os.environ['GITHUB_API_URL'] + '/repos/' + os.environ['GITHUB_REPOSITORY'] + '/actions/artifacts?per_page=100'
+        request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            artifacts = json.load(response)['artifacts']
+        numbers = [int(match.group(1)) for artifact in artifacts
+                   if (match := re.fullmatch(r'ios-ipa-([0-9]+)', artifact['name']))]
+        print(max(numbers, default=0))
+        PYARTIFACT
+        )"
+        major="${latest%%.*}"
+        if (( artifact_latest > 10#$major )); then
+          major="$artifact_latest"
+        fi
+        next=$((10#$major + 1))
+        echo "IOS_BUILD_NUMBER=$next" >> "$GITHUB_ENV"
+    - name: Build IPA
+      run: |
+        set -euo pipefail
+        if [[ "$APP_TYPE" == "flutter" ]]; then
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleVersion $(FLUTTER_BUILD_NUMBER)' ios/Runner/Info.plist
+          flutter build ipa --release --obfuscate \
+            --split-debug-info="$RUNNER_TEMP/private-symbols" \
+            --build-number="$IOS_BUILD_NUMBER" \
+            --export-options-plist="$RUNNER_TEMP/export_options.plist"
+        else
+          agvtool new-version -all "$IOS_BUILD_NUMBER"
+          if [[ "$XCODE_CONTAINER" == *.xcworkspace ]]; then
+            container=(--workspace "$XCODE_CONTAINER")
+          else
+            container=(--project "$XCODE_CONTAINER")
+          fi
+          xcode-project build-ipa "${container[@]}" \
+            --scheme "$XCODE_SCHEME" \
+            --archive-xcargs "CURRENT_PROJECT_VERSION=$IOS_BUILD_NUMBER" \
+            --ipa-directory "$APP_DIRECTORY/build/ios/ipa" \
+            --export-options-plist "$RUNNER_TEMP/export_options.plist"
+        fi
+    - name: Verify and prepare IPA
+      run: |
+        set -euo pipefail
+        python - <<'PYIPA'
+        import os, plistlib, re, zipfile
+        from pathlib import Path
+        files = list((Path(os.environ['APP_DIRECTORY']) / 'build/ios/ipa').glob('*.ipa'))
+        if len(files) != 1:
+            raise SystemExit(f'Expected exactly one IPA; found {len(files)}. Upload stopped.')
+        with zipfile.ZipFile(files[0]) as archive:
+            names = [n for n in archive.namelist() if re.fullmatch(r'Payload/[^/]+\.app/Info\.plist', n)]
+            if len(names) != 1:
+                raise SystemExit('IPA must contain exactly one main app Info.plist.')
+            info = plistlib.loads(archive.read(names[0]))
+        if info.get('CFBundleIdentifier') != os.environ['BUNDLE_ID']:
+            raise SystemExit('IPA Bundle ID mismatch. Upload stopped.')
+        if str(info.get('CFBundleVersion', '')) != os.environ['IOS_BUILD_NUMBER']:
+            raise SystemExit('IPA build number mismatch. Upload stopped.')
+        target = files[0].with_name('app.ipa')
+        if files[0] != target:
+            files[0].rename(target)
+        with open(os.environ['GITHUB_ENV'], 'a') as stream:
+            stream.write(f'IPA_PATH={target}\n')
+        print(f'Verified IPA: {info["CFBundleIdentifier"]}, version {info.get("CFBundleShortVersionString", "?")}, build {info["CFBundleVersion"]}')
+        PYIPA
+    - name: Save signed IPA
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+      with:
+        name: ios-ipa-${{ env.IOS_BUILD_NUMBER }}
+        path: ${{ env.IPA_PATH }}
+        if-no-files-found: error
+        retention-days: 3
+    - name: Save private debugging symbols
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+      with:
+        name: ios-private-symbols-${{ env.IOS_BUILD_NUMBER }}
+        path: ${{ runner.temp }}/private-symbols
+        if-no-files-found: error
+        retention-days: 30
+      if: env.APP_TYPE == 'flutter'
+    - name: Upload to App Store Connect
+      env:
+        APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        APP_STORE_CONNECT_KEY_IDENTIFIER: ${{ secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
+        APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+      run: |-
+        app-store-connect publish --path "$IPA_PATH"
+      if: ${{ inputs.upload_to_testflight }}
