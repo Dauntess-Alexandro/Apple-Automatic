@@ -429,7 +429,7 @@ class BuildService(AppleAppClient):
             if old == text:
                 return
         self.log('Настраиваю сборку в репозитории…')
-        body = {'message': 'Configure Apple Automatic iOS upload', 'branch': branch,
+        body = {'message': 'iOS build ' + uuid.uuid4().hex[:8], 'branch': branch,
                 'content': base64.b64encode(text.encode()).decode()}
         if current:
             body['sha'] = current['sha']

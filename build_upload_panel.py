@@ -387,6 +387,9 @@ class BuildUploadPanel(QScrollArea):
         if not choices:
             if len(apps) == 1:
                 self._apply_detected_app(apps[0])
+                self.show_error(f'В Apple у «{apps[0]["app_name"]}» Bundle ID {apps[0]["bundle_id"]}, а в Projects проекта '
+                                'с таким Bundle ID нет. Проверьте PRODUCT_BUNDLE_IDENTIFIER в Xcode или нажмите «Указать проект…».')
+                return
             self.show_error('Совпадений по Bundle ID в Projects нет. Нажмите «Указать проект…». Для поиска нужны исходники iOS с Bundle ID в Xcode.')
             return
         choice = choices[0]
