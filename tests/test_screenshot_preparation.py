@@ -169,7 +169,7 @@ class ScreenshotDeliveryTests(unittest.TestCase):
         with tempfile.NamedTemporaryFile() as source:
             source.write(b'image')
             source.flush()
-            with patch.object(app.requests, 'put', side_effect=app.requests.exceptions.Timeout('timeout')), patch.object(app.time, 'sleep'):
+            with patch.object(app.http_client, 'put', side_effect=app.requests.exceptions.Timeout('timeout')), patch.object(app.time, 'sleep'):
                 with self.assertRaises(app.requests.exceptions.Timeout):
                     client.upload_screenshot('set', source.name, 'image.jpg')
         client.delete_screenshot.assert_called_once_with('shot')

@@ -38,7 +38,7 @@ class AppStoreRetryBehaviorTests(unittest.TestCase):
         def fake_patch(*_args, **_kwargs):
             return responses.pop(0)
 
-        with patch.object(app.requests, "patch", side_effect=fake_patch):
+        with patch.object(app.http_client, "patch", side_effect=fake_patch):
             result = client._request(
                 "PATCH",
                 "appScreenshots/screenshot-id",

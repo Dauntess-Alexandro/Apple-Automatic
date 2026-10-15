@@ -7,6 +7,7 @@ import io
 import csv
 import jwt
 import requests
+import http_client
 import threading
 import concurrent.futures
 from datetime import datetime
@@ -458,6 +459,32 @@ def _extract_chat_completion_text(data, provider_name="AI"):
     return text
 
 
+AI_RETRY_STATUS_CODES = (408, 429, 500, 502, 503, 504, 520, 522, 524)
+
+
+def _post_ai_with_retries(url, headers, payload, timeout, max_retries, parse_error):
+    """POST к AI-провайдеру: повторяем и 429/5xx, и обрывы сети / таймауты."""
+    max_retries = max(1, int(max_retries or 1))
+    for attempt in range(max_retries):
+        try:
+            response = http_client.post(url, headers=headers, json=payload, timeout=timeout)
+        except requests.exceptions.RequestException as exc:
+            if attempt >= max_retries - 1 or not _is_transient_network_error(exc):
+                raise Exception(f"Сетевая ошибка AI: {type(exc).__name__}: {exc}") from exc
+            time.sleep(min(2 ** attempt, 8))
+            continue
+        if response.status_code not in AI_RETRY_STATUS_CODES:
+            if response.status_code >= 400:
+                raise Exception(parse_error(response))
+            return response
+        if attempt >= max_retries - 1:
+            raise Exception(parse_error(response))
+        retry_after = response.headers.get("Retry-After", "")
+        delay = float(retry_after) if retry_after.isdigit() else 2 ** attempt
+        time.sleep(min(delay, 20))
+    raise Exception("AI запрос не выполнен.")
+
+
 def aitunnel_chat_completion(api_key, model, messages, temperature=0.7, json_mode=False, timeout=90, max_retries=4):
     payload = {
         "model": model,
@@ -467,24 +494,17 @@ def aitunnel_chat_completion(api_key, model, messages, temperature=0.7, json_mod
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
-    response = None
-    for attempt in range(max_retries):
-        response = requests.post(
-            f"{AITUNNEL_API_BASE}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=timeout,
-        )
-        if response.status_code not in (429, 500, 502, 503, 504):
-            if response.status_code >= 400:
-                raise Exception(parse_aitunnel_error(response))
-            break
-        if attempt == max_retries - 1:
-            raise Exception(parse_aitunnel_error(response))
-        time.sleep(2 ** attempt)
+    response = _post_ai_with_retries(
+        f"{AITUNNEL_API_BASE}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        payload=payload,
+        timeout=timeout,
+        max_retries=max_retries,
+        parse_error=parse_aitunnel_error,
+    )
 
     return _extract_chat_completion_text(response.json(), "AITUNNEL")
 
@@ -534,24 +554,17 @@ def aitunnel_image_generation(api_key, model, prompt, size=ICON_IMAGE_SIZE, outp
         "size": size,
         "output_format": output_format,
     }
-    response = None
-    for attempt in range(max_retries):
-        response = requests.post(
-            f"{AITUNNEL_API_BASE}/images/generations",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=timeout,
-        )
-        if response.status_code not in (429, 500, 502, 503, 504):
-            if response.status_code >= 400:
-                raise Exception(parse_aitunnel_error(response))
-            break
-        if attempt == max_retries - 1:
-            raise Exception(parse_aitunnel_error(response))
-        time.sleep(2 ** attempt)
+    response = _post_ai_with_retries(
+        f"{AITUNNEL_API_BASE}/images/generations",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        payload=payload,
+        timeout=timeout,
+        max_retries=max_retries,
+        parse_error=parse_aitunnel_error,
+    )
 
     data = response.json()
     items = data.get("data") or []
@@ -581,25 +594,18 @@ def zai_chat_completion(api_key, model, messages, temperature=0.7, json_mode=Fal
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
-    response = None
-    for attempt in range(max_retries):
-        response = requests.post(
-            f"{ZAI_API_BASE}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "Accept-Language": "en-US,en",
-            },
-            json=payload,
-            timeout=timeout,
-        )
-        if response.status_code not in (429, 500, 502, 503, 504):
-            if response.status_code >= 400:
-                raise Exception(parse_zai_error(response))
-            break
-        if attempt == max_retries - 1:
-            raise Exception(parse_zai_error(response))
-        time.sleep(2 ** attempt)
+    response = _post_ai_with_retries(
+        f"{ZAI_API_BASE}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept-Language": "en-US,en",
+        },
+        payload=payload,
+        timeout=timeout,
+        max_retries=max_retries,
+        parse_error=parse_zai_error,
+    )
 
     return _extract_chat_completion_text(response.json(), "Z.AI")
 
@@ -867,7 +873,7 @@ def gitlab_search_projects(search, token=None, base_url=None, per_page=50):
         raise RuntimeError("Нет GITLAB_TOKEN.")
     if not search:
         raise RuntimeError("Пустой поисковый запрос GitLab.")
-    response = requests.get(
+    response = http_client.get(
         f"{base}/api/v4/projects",
         headers={"PRIVATE-TOKEN": token, "Accept": "application/json"},
         params={
@@ -895,7 +901,7 @@ def gitlab_get_project(project_ref, token=None, base_url=None):
     if not project_ref:
         raise RuntimeError("Пустой GitLab project.")
     encoded = quote(project_ref, safe="")
-    response = requests.get(
+    response = http_client.get(
         f"{base}/api/v4/projects/{encoded}",
         headers={"PRIVATE-TOKEN": token, "Accept": "application/json"},
         timeout=45,
@@ -1017,7 +1023,7 @@ def gitlab_fetch_file_raw(
             branches.append(branch)
     last_error = None
     for branch in branches:
-        response = requests.get(
+        response = http_client.get(
             f"{base}/api/v4/projects/{project_id}/repository/files/{encoded}/raw",
             headers={"PRIVATE-TOKEN": token},
             params={"ref": branch},
@@ -1298,7 +1304,7 @@ def storepal_api_request(method, path, token=None, payload=None, params=None, ti
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    response = requests.request(
+    response = http_client.request(
         method.upper(),
         url,
         headers=headers,
@@ -1630,7 +1636,7 @@ def formspree_fetch_submissions(form_id, api_key, limit=50, offset=0):
             "(нужен Professional/Business)."
         )
     url = f"https://formspree.io/api/0/forms/{form_id}/submissions"
-    response = requests.get(
+    response = http_client.get(
         url,
         params={"limit": int(limit), "offset": int(offset), "order": "desc"},
         headers={
@@ -1641,7 +1647,7 @@ def formspree_fetch_submissions(form_id, api_key, limit=50, offset=0):
     )
     if response.status_code == 401:
         # fallback basic auth as in Formspree docs: curl -u :API_KEY
-        response = requests.get(
+        response = http_client.get(
             url,
             params={"limit": int(limit), "offset": int(offset), "order": "desc"},
             auth=("", api_key),
@@ -1922,7 +1928,7 @@ def host_html_via_brewpage(html_content, filename="page.html", ttl_days=30, brew
     """Публикует HTML на brewpage.app — отдаёт как text/html (в отличие от catbox)."""
     ttl_days = max(1, min(int(ttl_days or 30), 30))
     ns = _normalize_brewpage_ns(brewpage_ns)
-    response = requests.post(
+    response = http_client.post(
         f"{BREWPAGE_HTML_API}?ns={ns}&ttl={ttl_days}",
         headers={
             "Content-Type": "application/json",
@@ -1962,7 +1968,7 @@ def host_html_via_zerodeploy(html_content, filename="index.html"):
     Всегда кладём как index.html, иначе корень сайта отдаёт 404
     (файл доступен только по /имя.html).
     """
-    response = requests.post(
+    response = http_client.post(
         ZERODEPLOY_DROP_URL,
         headers={
             "Content-Type": "text/html; charset=utf-8",
@@ -1999,7 +2005,7 @@ def host_html_via_zerodeploy(html_content, filename="index.html"):
 
 def host_html_via_litterbox(html_content, filename="page.html", time="72h"):
     """Временный HTML на litterbox (catbox sibling). Обычно text/html, до 72ч."""
-    response = requests.post(
+    response = http_client.post(
         LITTERBOX_UPLOAD_URL,
         data={"reqtype": "fileupload", "time": time or "72h"},
         files={"fileToUpload": (filename, (html_content or "").encode("utf-8"), "text/html; charset=utf-8")},
@@ -2015,7 +2021,7 @@ def host_html_via_litterbox(html_content, filename="page.html", time="72h"):
 
 def host_html_via_catbox(html_content, filename="page.html"):
     """Заливает HTML на catbox.moe и возвращает публичный URL (fallback)."""
-    response = requests.post(
+    response = http_client.post(
         CATBOX_UPLOAD_URL,
         data={"reqtype": "fileupload"},
         files={"fileToUpload": (filename, (html_content or "").encode("utf-8"), "text/html; charset=utf-8")},
@@ -2066,9 +2072,9 @@ def check_public_url_alive(url, timeout=12):
         return False, "не http(s)"
     headers = {"User-Agent": "PPO-Automation/1.0"}
     try:
-        response = requests.head(raw, timeout=timeout, allow_redirects=True, headers=headers)
+        response = http_client.head(raw, timeout=timeout, allow_redirects=True, headers=headers)
         if response.status_code in (403, 405, 501):
-            response = requests.get(
+            response = http_client.get(
                 raw,
                 timeout=timeout,
                 allow_redirects=True,
@@ -3184,7 +3190,7 @@ def ensure_flags_downloaded():
         
         def fetch(cc):
             try:
-                r = requests.get(f"https://flagcdn.com/w20/{cc}.png", timeout=5)
+                r = http_client.get(f"https://flagcdn.com/w20/{cc}.png", timeout=5)
                 if r.status_code == 200:
                     with open(os.path.join(FLAGS_CACHE_DIR, f"{cc}.png"), "wb") as f:
                         f.write(r.content)
@@ -3240,7 +3246,7 @@ def figma_api_get(path, token, params=None, timeout=60):
         "X-Figma-Token": token,
         "Accept": "application/json",
     }
-    response = requests.get(
+    response = http_client.get(
         f"{FIGMA_API_BASE}{path}",
         headers=headers,
         params=params or {},
@@ -3385,7 +3391,7 @@ def download_figma_page_screenshots(figma_url, token, dest_dir=None, logger=None
         filename = _figma_safe_filename(node.get("name"), index, nid)
         out_path = os.path.join(dest_dir, filename)
         log(f"Figma: скачиваю {index}/{len(export_nodes)} — {filename}")
-        response = requests.get(image_url, timeout=120)
+        response = http_client.get(image_url, timeout=120)
         response.raise_for_status()
         with open(out_path, "wb") as f:
             f.write(response.content)
@@ -3889,14 +3895,22 @@ class ASCClient:
     def _generate_token(self):
         if not self.private_key:
             raise Exception("Приватный ключ не загружен. Проверьте путь к файлу .p8")
-            
+
+        # JWT живёт 20 минут — переиспользуем, пока до истечения больше 5 минут.
+        now = int(time.time())
+        cached = getattr(self, "_token_cache", None)
+        if cached and cached[1] - now > 300:
+            return cached[0]
         headers = {"kid": self.key_id, "typ": "JWT"}
+        expires_at = now + 1200
         payload = {
             "iss": self.issuer_id,
-            "exp": int(time.time()) + 1200,
+            "exp": expires_at,
             "aud": "appstoreconnect-v1"
         }
-        return jwt.encode(payload, self.private_key, algorithm="ES256", headers=headers)
+        token = jwt.encode(payload, self.private_key, algorithm="ES256", headers=headers)
+        self._token_cache = (token, expires_at)
+        return token
 
     # Умная функция запроса с защитой от лимитов Apple и повтором при обрыве сети
     def _request(self, method, endpoint, payload=None, max_retries=API_REQUEST_MAX_RETRIES):
@@ -3910,13 +3924,13 @@ class ASCClient:
             }
             try:
                 if method == "GET":
-                    response = requests.get(url, headers=headers, timeout=120)
+                    response = http_client.get(url, headers=headers, timeout=120)
                 elif method == "POST":
-                    response = requests.post(url, headers=headers, json=payload, timeout=120)
+                    response = http_client.post(url, headers=headers, json=payload, timeout=120)
                 elif method == "PATCH":
-                    response = requests.patch(url, headers=headers, json=payload, timeout=120)
+                    response = http_client.patch(url, headers=headers, json=payload, timeout=120)
                 elif method == "DELETE":
-                    response = requests.delete(url, headers=headers, timeout=120)
+                    response = http_client.delete(url, headers=headers, timeout=120)
                     response.raise_for_status()
                     return {} 
                 else:
@@ -3927,7 +3941,11 @@ class ASCClient:
                 
             except requests.exceptions.RequestException as e:
                 retryable = False
-                if e.response is not None and e.response.status_code in API_RETRY_STATUS_CODES:
+                if e.response is not None and e.response.status_code == 401 and attempt == 0:
+                    # Протухший/отклонённый JWT — выпускаем новый и пробуем ещё раз.
+                    self._token_cache = None
+                    retryable = True
+                elif e.response is not None and e.response.status_code in API_RETRY_STATUS_CODES:
                     retryable = True
                 elif _is_transient_network_error(e):
                     retryable = True
@@ -4690,7 +4708,7 @@ class ASCClient:
 
                     for attempt in range(SCREENSHOT_FILE_UPLOAD_RETRIES):
                         try:
-                            req = requests.put(
+                            req = http_client.put(
                                 operation["url"], headers=headers, data=chunk, timeout=180
                             )
                             req.raise_for_status()
@@ -5198,6 +5216,26 @@ class FetchAppVersionWorker(QThread):
             self.log_msg.emit(f"Ошибка загрузки версии приложения: {str(e)}")
 
 
+class ModelCatalogWorker(QThread):
+    catalogs_ready = Signal(dict)
+
+    def run(self):
+        catalogs = {}
+        jobs = {
+            "translation": fetch_aitunnel_translation_model_catalog,
+            "metadata": fetch_aitunnel_metadata_model_catalog,
+            "image": fetch_aitunnel_image_model_catalog,
+        }
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+            futures = {key: executor.submit(func) for key, func in jobs.items()}
+            for key, future in futures.items():
+                try:
+                    catalogs[key] = future.result()
+                except Exception:
+                    pass
+        self.catalogs_ready.emit(catalogs)
+
+
 class FetchAppsWorker(QThread):
     log_msg = Signal(str)
     apps_fetched = Signal(list)
@@ -5342,7 +5380,7 @@ Source text:
                     [{"role": "user", "content": prompt}],
                     temperature=0.2,
                     timeout=90,
-                    max_retries=1,
+                    max_retries=3,
                 )
             except Exception as exc:
                 if attempt == 3:
@@ -6339,7 +6377,7 @@ class JiraWorker(QThread):
 
             payload = {"fields": fields}
             self.log_msg.emit(f"Обновляю Jira карточку {self.issue_key}...")
-            resp = requests.put(
+            resp = http_client.put(
                 f"{self.base_url}/rest/api/3/issue/{self.issue_key}",
                 headers=headers,
                 json=payload,
@@ -7776,10 +7814,23 @@ class MainWindow(QWidget):
         zai_settings_layout.addLayout(zai_model_row)
         api_layout.addWidget(self.zai_settings_widget)
 
-        self._populate_aitunnel_models(select_model=resolve_aitunnel_translation_model())
-        self._populate_aitunnel_metadata_models(select_model=resolve_aitunnel_metadata_model())
-        self._populate_aitunnel_image_models(select_model=resolve_aitunnel_image_model())
+        # Сразу показываем встроенные списки, а актуальные модели подтягиваем в фоне,
+        # чтобы запуск не зависал на медленной сети.
+        self._populate_aitunnel_models(
+            catalog=[(m, m, 0.0) for m in DEFAULT_AITUNNEL_TRANSLATION_MODELS],
+            select_model=resolve_aitunnel_translation_model(),
+        )
+        self._populate_aitunnel_metadata_models(
+            catalog=[(m, m, 0.0) for m in DEFAULT_AITUNNEL_METADATA_MODELS],
+            select_model=resolve_aitunnel_metadata_model(),
+        )
+        self._populate_aitunnel_image_models(
+            catalog=[(m, m, 0.0) for m in DEFAULT_AITUNNEL_IMAGE_MODELS],
+            select_model=resolve_aitunnel_image_model(),
+        )
         self._populate_zai_models(select_model=resolve_ai_model(AI_PROVIDER_ZAI))
+        self.model_catalog_worker = None
+        QTimer.singleShot(0, self._start_model_catalog_refresh)
         self._sync_ai_provider_ui()
 
         concurrency_separator = QFrame()
@@ -9479,41 +9530,66 @@ class MainWindow(QWidget):
 
         worker.finished.connect(_cleanup)
 
-    def _wait_for_workers(self, attr_names, timeout_ms=5000):
-        for attr_name in attr_names:
-            worker = getattr(self, attr_name, None)
-            if worker is not None and worker.isRunning():
-                worker.wait(timeout_ms)
+    def _running_threads(self):
+        threads = []
+        candidates = list(vars(self).values()) + list(self.findChildren(QThread))
+        for panel_name in ("tab_build_upload", "screenshot_library"):
+            panel = getattr(self, panel_name, None)
+            if panel is not None:
+                candidates.append(getattr(panel, "worker", None))
+        # Фоновая загрузка списка моделей не важна — её не спрашиваем при закрытии.
+        ignored = getattr(self, "model_catalog_worker", None)
+        for candidate in candidates:
+            if candidate is ignored:
+                continue
+            if isinstance(candidate, QThread) and candidate.isRunning() and candidate not in threads:
+                threads.append(candidate)
+        return threads
 
     def closeEvent(self, event):
+        running = self._running_threads()
+        if running:
+            answer = QMessageBox.question(
+                self,
+                "Идёт работа",
+                f"Сейчас выполняются фоновые задачи ({len(running)}): загрузка, перевод или запросы к Apple.\n\n"
+                "Закрыть приложение принудительно? Незавершённые операции будут прерваны "
+                "(сборка в GitHub продолжит работать).",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            for thread in running:
+                thread.requestInterruption()
+            self._shutdown_now()
+            return
         build_panel = getattr(self, "tab_build_upload", None)
-        if build_panel is not None and not build_panel.prepare_close():
-            event.ignore()
-            return
-        panel = getattr(self, "screenshot_library", None)
-        if panel is not None and panel.is_busy():
-            panel.notice.setText("Дождитесь завершения загрузки или назначения ассетов.")
-            event.ignore()
-            return
-        self._wait_for_workers((
-            "app_version_fetcher",
-            "metadata_fetcher",
-            "apps_fetcher",
-            "worker",
-            "jira_worker",
-            "gemini_worker",
-            "screenshot_upload_worker",
-            "locale_refresh_worker",
-            "locale_prefetch_worker",
-            "translation_upload_worker",
-            "translation_worker",
-            "figma_import_worker",
-            "privacy_pages_worker",
-            "privacy_oneshot_worker",
-            "gitlab_brief_worker",
-            "screenshot_brief_worker",
-        ))
+        if build_panel is not None:
+            build_panel.prepare_close()
         super().closeEvent(event)
+
+    def _shutdown_now(self):
+        """Экстренный выход: потоки requests/ThreadPoolExecutor нельзя прервать, поэтому
+        не ждём их, а завершаем процесс сразу (иначе окно закрывается, а процесс висит)."""
+        try:
+            self._save_env_to_file()
+        except Exception:
+            pass
+        build_panel = getattr(self, "tab_build_upload", None)
+        if build_panel is not None:
+            try:
+                build_panel.auto_project_timer.stop()
+            except Exception:
+                pass
+        self.hide()
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(0)
 
     def _pull_metadata_from_apple(self):
         self._save_env_to_file()
@@ -12399,20 +12475,43 @@ class MainWindow(QWidget):
 
     def _refresh_aitunnel_models(self):
         self._log("Обновляю актуальные модели AITUNNEL для перевода, скриншотов и метаданных...")
-        translation_catalog = fetch_aitunnel_translation_model_catalog()
-        metadata_catalog = fetch_aitunnel_metadata_model_catalog()
-        self._populate_aitunnel_models(
-            catalog=translation_catalog,
-            select_model=self._selected_ai_model(AI_PROVIDER_AITUNNEL),
+        self._start_model_catalog_refresh(log_result=True)
+
+    def _start_model_catalog_refresh(self, log_result=False):
+        if self._worker_is_running("model_catalog_worker"):
+            return
+        worker = ModelCatalogWorker()
+        worker.catalogs_ready.connect(
+            lambda catalogs: self._apply_model_catalogs(catalogs, log_result=log_result)
         )
-        self._populate_aitunnel_metadata_models(
-            catalog=metadata_catalog,
-            select_model=self._selected_aitunnel_metadata_model(),
-        )
-        self._log(
-            f"✅ Перевод: {len(translation_catalog)} моделей. "
-            f"Скриншоты/метаданные: {len(metadata_catalog)} моделей с поддержкой изображений."
-        )
+        self._track_worker("model_catalog_worker", worker)
+        worker.start()
+
+    def _apply_model_catalogs(self, catalogs, log_result=False):
+        translation_catalog = catalogs.get("translation")
+        metadata_catalog = catalogs.get("metadata")
+        image_catalog = catalogs.get("image")
+        if translation_catalog:
+            self._populate_aitunnel_models(
+                catalog=translation_catalog,
+                select_model=self._selected_ai_model(AI_PROVIDER_AITUNNEL),
+            )
+        if metadata_catalog:
+            self._populate_aitunnel_metadata_models(
+                catalog=metadata_catalog,
+                select_model=self._selected_aitunnel_metadata_model(),
+            )
+        if image_catalog:
+            self._populate_aitunnel_image_models(
+                catalog=image_catalog,
+                select_model=self._selected_aitunnel_image_model(),
+            )
+        if log_result:
+            self._log(
+                f"✅ Перевод: {len(translation_catalog or [])} моделей. "
+                f"Скриншоты/метаданные: {len(metadata_catalog or [])} моделей с поддержкой изображений. "
+                f"Картинки: {len(image_catalog or [])}."
+            )
 
     def _populate_aitunnel_image_models(self, catalog=None, select_model=None):
         if not hasattr(self, "aitunnel_image_model_combo"):
@@ -12437,12 +12536,7 @@ class MainWindow(QWidget):
 
     def _refresh_aitunnel_image_models(self):
         self._log("Загружаю модели генерации картинок AITUNNEL...")
-        catalog = fetch_aitunnel_image_model_catalog()
-        self._populate_aitunnel_image_models(
-            catalog=catalog,
-            select_model=self._selected_aitunnel_image_model(),
-        )
-        self._log(f"✅ В списке image-моделей: {len(catalog)}")
+        self._start_model_catalog_refresh(log_result=True)
 
     def _save_env_to_file(self):
         existing = _read_env_file()
@@ -13595,4 +13689,11 @@ if __name__ == "__main__":
     window = MainWindow()
     window.showMaximized()
     QTimer.singleShot(0, window._maximize_to_screen)
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    # Не ждём «зависшие» сетевые потоки пулов при выходе интерпретатора.
+    os._exit(exit_code)
