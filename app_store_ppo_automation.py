@@ -4122,10 +4122,18 @@ class ASCClient:
         return primary_locale
 
     def get_app_info(self):
-        data = self._request("GET", f"apps/{self.app_id}/appInfos?limit=1")
-        if not data.get("data"):
+        """Редактируемый appInfo: при живой версии у приложения их два, live менять нельзя."""
+        data = self._request("GET", f"apps/{self.app_id}/appInfos?limit=10")
+        items = data.get("data") or []
+        if not items:
             raise Exception("Не найден appInfo для приложения.")
-        return data["data"][0]["id"]
+        live_states = {"READY_FOR_DISTRIBUTION", "READY_FOR_SALE", "REPLACED_WITH_NEW_INFO"}
+        for item in items:
+            attrs = item.get("attributes") or {}
+            state = attrs.get("state") or attrs.get("appStoreState") or ""
+            if state not in live_states:
+                return item["id"]
+        return items[0]["id"]
 
     def get_app_info_localization_records(self, app_info_id):
         endpoint = f"appInfos/{app_info_id}/appInfoLocalizations?limit=200"
@@ -4223,11 +4231,36 @@ class ASCClient:
             self.logger(f"[{locale}] Локаль создана с support/marketing URL.")
         return created_id, True
 
-    def ensure_app_info_localization(self, app_info_id, locale):
+    def resolve_app_info_name(self, app_info_id):
+        """Name для новой app info локали (Apple требует его при создании): primary → любая."""
+        records = self.get_app_info_localization_records(app_info_id)
+        primary_locale = None
+        try:
+            primary_locale = self.get_app_primary_locale()
+        except Exception:
+            pass
+        ordered = sorted(
+            records,
+            key=lambda r: (r.get("attributes") or {}).get("locale") != primary_locale,
+        )
+        for record in ordered:
+            name = str((record.get("attributes") or {}).get("name", "") or "").strip()
+            if name:
+                return name
+        return ""
+
+    def ensure_app_info_localization(self, app_info_id, locale, attributes=None):
+        """Возвращает (id, created). Новую локаль создаёт сразу с attributes и name."""
         existing = self.get_app_info_localization_by_locale(app_info_id, locale)
         if existing:
             return existing["id"], False
-        created_id = self.create_app_info_localization(app_info_id, locale, {})
+        create_attrs = dict(attributes or {})
+        if not str(create_attrs.get("name", "") or "").strip():
+            name = self.resolve_app_info_name(app_info_id)
+            if not name:
+                raise Exception("Не удалось определить name приложения для новой app info локали.")
+            create_attrs["name"] = name
+        created_id = self.create_app_info_localization(app_info_id, locale, create_attrs)
         return created_id, True
 
     def get_primary_copy_payload(self, version_id, app_info_id=None, overrides=None):
@@ -5629,10 +5662,13 @@ class LocalizationUploadWorker(QThread):
                         )
                         fields_uploaded += len(attrs)
                 if payloads["app_info"]:
-                    loc_id, created = local_client.ensure_app_info_localization(app_info_id, locale)
                     attrs = sanitize_app_info_localization_attributes(payloads["app_info"], self.log_msg.emit)
                     if attrs:
-                        local_client.update_app_info_localization(loc_id, attrs)
+                        loc_id, created = local_client.ensure_app_info_localization(
+                            app_info_id, locale, attrs
+                        )
+                        if not created:
+                            local_client.update_app_info_localization(loc_id, attrs)
                         self.log_msg.emit(
                             f"✅ [{locale}] app info localization {'создана' if created else 'обновлена'}."
                         )
